@@ -1,6 +1,56 @@
 # AIDB - AI-Native Database
 
-AIDB is an AI-native database built from scratch in Go, designed to store schema-full and schema-less JSON documents, with future support for vectors, text data, and embeddings.
+AIDB is an AI-first native database built in Go, designed to store structured and unstructured JSON, vectors, and text, with strong data safety guarantees.
+It supports:
+
+ML-ready storage pipeline (data → indexing → embedding generation)
+queryable data for AI retrieval and semantic search
+automated "importance weight" tracking from top requested documents/fields
+safe persistence + replication to avoid data loss
+
+Done
+JSON Document Storage CRUD
+Collections: schema-less + strict schema with validation
+BoltDB persistence (disk survival, restart-safe)
+REST API api/v1
+document filter queries and structured list/get/update/patch/delete
+export/import with optional schema and overwrite behavior
+schema field type constraints
+health endpoint
+tests script
+
+
+New Upcoming features
+index layer for faster lookups on fields
+vector search pipeline (dense vector store, ANN algorithm support)
+full-text search (tokenization, scoring, phrase search)
+basic NoSQL aggregation operators ($match, $group, $project, $sort, $limit, $unwind)
+data durability: WAL, periodic snapshots, schema migration safety
+replication/HA mode (primary/replica + auto-failover)
+fail-safe: write-ahead logging, commit acknowledgement, consistency checks
+AI-oriented metrics for data importance + retraining weight signals
+export to model training dataset formats (JSONL, parquet, embeddings TSV)
+
+Pending/Roadmap
+clustered distributed SQL-like query planner, sharding
+full AQL (AIDB Query Language) with joins, window functions
+cross-collection transactions
+vector index types: HNSW, IVF, PQ, dynamic quantization
+real-time change streams / CDC for external training pipelines
+role-based access control, multi-tenancy
+point-in-time recovery
+strong consistency modes (CP tuning in CAP)
+automated embedding generation pipelines (openAI/local LLM integrations)
+document-level encryption + user-managed key support
+SQL compatibility layer (PostgreSQL wire protocol)
+
+AIDB is a unified engine where data becomes searchable and semantically usable for AI.
+It is designed to:
+
+store authoritative JSON data and ingest rich vectors/text.
+keep “most used” objects weighted for retraining flows.
+supply embeddings + relevance scores for RAG and inference.
+be production-safe with replication, persistent logs, and recovery.
 
 ## Current Features
 
