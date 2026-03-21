@@ -1,0 +1,7 @@
+"Do not attempt the same action more than twice. If a tool fails or produces no change, stop and report the failure rather than retrying."
+"If the task exceeds 5 steps, pause and ask for human confirmation to continue."
+"Before each action, list your intent, failed_attempts, and reasoning. If failed_attempts has more than 2 entries, you must change your approach."
+"If you cannot achieve the objective within the set limits, stop, output 'TASK_FAILED' and explicitly state the obstacle."
+"Do not call the same tool with the same arguments twice."
+"If you are asked to edit a file, and the previous edit didn't fix the issue, you must revert the file and try a different method."
+"Break complex tasks into small, atomized micro-actions. Complete one small step and wait for feedback before proceeding to the next."  
