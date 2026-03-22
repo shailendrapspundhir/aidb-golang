@@ -137,6 +137,46 @@ func (s *MemoryStorage) Clear() error {
 	return nil
 }
 
+// Close closes the storage (no-op for memory storage)
+func (s *MemoryStorage) Close() error {
+	return nil
+}
+
+// Flush flushes data to disk (no-op for memory storage)
+func (s *MemoryStorage) Flush() error {
+	return nil
+}
+
+// GetRaw retrieves raw bytes by ID (not supported for memory storage)
+func (s *MemoryStorage) GetRaw(id string) ([]byte, error) {
+	return nil, ErrDocumentNotFound
+}
+
+// PutRaw stores raw bytes by ID (not supported for memory storage)
+func (s *MemoryStorage) PutRaw(id string, data []byte) error {
+	return nil
+}
+
+// DeleteRaw removes raw bytes by ID (not supported for memory storage)
+func (s *MemoryStorage) DeleteRaw(id string) error {
+	return nil
+}
+
+// ImportDocuments imports multiple documents at once
+func (s *MemoryStorage) ImportDocuments(docs []*document.Document) error {
+	for _, doc := range docs {
+		if err := s.Insert(doc); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// CompactRange compacts the storage (no-op for memory storage)
+func (s *MemoryStorage) CompactRange(start, end string) error {
+	return nil
+}
+
 // copyDocument creates a deep copy of a document
 func (s *MemoryStorage) copyDocument(doc *document.Document) *document.Document {
 	copy := &document.Document{
@@ -165,4 +205,67 @@ func matchesFilter(doc *document.Document, filter map[string]interface{}) bool {
 	}
 
 	return true
+}
+
+// memoryCursor implements Cursor for MemoryStorage
+type memoryCursor struct {
+	storage   *MemoryStorage
+	keys      []string
+	index     int
+	current   *document.Document
+	err       error
+	closed    bool
+}
+
+// Cursor returns a streaming iterator over all documents
+func (s *MemoryStorage) Cursor() (Cursor, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	keys := make([]string, 0, len(s.documents))
+	for k := range s.documents {
+		keys = append(keys, k)
+	}
+
+	return &memoryCursor{
+		storage: s,
+		keys:    keys,
+		index:   -1,
+	}, nil
+}
+
+func (c *memoryCursor) Next() bool {
+	if c.closed || c.err != nil {
+		return false
+	}
+	c.index++
+	if c.index >= len(c.keys) {
+		c.current = nil
+		return false
+	}
+
+	c.storage.mu.RLock()
+	doc, exists := c.storage.documents[c.keys[c.index]]
+	c.storage.mu.RUnlock()
+
+	if !exists {
+		c.current = nil
+		return c.Next() // skip deleted
+	}
+	c.current = c.storage.copyDocument(doc)
+	return true
+}
+
+func (c *memoryCursor) Current() *document.Document {
+	return c.current
+}
+
+func (c *memoryCursor) Err() error {
+	return c.err
+}
+
+func (c *memoryCursor) Close() error {
+	c.closed = true
+	c.current = nil
+	return nil
 }

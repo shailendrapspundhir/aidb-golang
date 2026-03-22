@@ -226,3 +226,66 @@ func (s *PersistentStorage) copyDocument(doc *document.Document) *document.Docum
 	}
 	return copy
 }
+
+// persistentCursor implements Cursor for PersistentStorage
+type persistentCursor struct {
+	storage  *PersistentStorage
+	keys     []string
+	index    int
+	current  *document.Document
+	err      error
+	closed   bool
+}
+
+// Cursor returns a streaming iterator over all documents
+func (s *PersistentStorage) Cursor() (Cursor, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	keys := make([]string, 0, len(s.documents))
+	for k := range s.documents {
+		keys = append(keys, k)
+	}
+
+	return &persistentCursor{
+		storage: s,
+		keys:    keys,
+		index:   -1,
+	}, nil
+}
+
+func (c *persistentCursor) Next() bool {
+	if c.closed || c.err != nil {
+		return false
+	}
+	c.index++
+	if c.index >= len(c.keys) {
+		c.current = nil
+		return false
+	}
+
+	c.storage.mu.RLock()
+	doc, exists := c.storage.documents[c.keys[c.index]]
+	c.storage.mu.RUnlock()
+
+	if !exists {
+		c.current = nil
+		return c.Next() // skip deleted
+	}
+	c.current = c.storage.copyDocument(doc)
+	return true
+}
+
+func (c *persistentCursor) Current() *document.Document {
+	return c.current
+}
+
+func (c *persistentCursor) Err() error {
+	return c.err
+}
+
+func (c *persistentCursor) Close() error {
+	c.closed = true
+	c.current = nil
+	return nil
+}

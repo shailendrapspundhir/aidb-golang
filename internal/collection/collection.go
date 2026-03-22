@@ -18,6 +18,8 @@ type Collection struct {
 	Name    string
 	Schema  *document.Schema
 	storage storage.Storage
+	indexes map[string]storage.Index // field -> index
+	manager *Manager                  // Reference to manager for $lookup cross-collection queries
 	mu      sync.RWMutex
 }
 
@@ -27,6 +29,7 @@ func NewCollection(name string, schema *document.Schema) *Collection {
 		Name:    name,
 		Schema:  schema,
 		storage: storage.NewMemoryStorage(),
+		indexes: make(map[string]storage.Index),
 	}
 }
 
@@ -36,7 +39,66 @@ func NewCollectionWithStorage(name string, schema *document.Schema, store storag
 		Name:    name,
 		Schema:  schema,
 		storage: store,
+		indexes: make(map[string]storage.Index),
 	}
+}
+
+// CreateIndex creates an index on a field
+func (c *Collection) CreateIndex(field string, indexType storage.IndexType) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, exists := c.indexes[field]; exists {
+		return fmt.Errorf("index already exists on field: %s", field)
+	}
+
+	var idx storage.Index
+	switch indexType {
+	case storage.IndexTypeBTree:
+		idx = storage.NewBTreeIndex(fmt.Sprintf("%s_%s_idx", c.Name, field), field, 64)
+	case storage.IndexTypeHash:
+		idx = storage.NewHashIndex(fmt.Sprintf("%s_%s_idx", c.Name, field), field)
+	default:
+		return fmt.Errorf("unsupported index type: %s", indexType)
+	}
+
+	// Build index from existing documents
+	docs, err := c.storage.FindAll()
+	if err != nil {
+		return fmt.Errorf("failed to build index: %w", err)
+	}
+	for _, doc := range docs {
+		if value, exists := doc.Data[field]; exists {
+			idx.Insert(value, doc.ID)
+		}
+	}
+
+	c.indexes[field] = idx
+	return nil
+}
+
+// DropIndex removes an index
+func (c *Collection) DropIndex(field string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, exists := c.indexes[field]; !exists {
+		return fmt.Errorf("index not found on field: %s", field)
+	}
+
+	delete(c.indexes, field)
+	return nil
+}
+
+// GetIndexes returns all indexes
+func (c *Collection) GetIndexes() map[string]storage.Index {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	result := make(map[string]storage.Index)
+	for k, v := range c.indexes {
+		result[k] = v
+	}
+	return result
 }
 
 // Insert stores a new document in the collection
@@ -51,7 +113,19 @@ func (c *Collection) Insert(doc *document.Document) error {
 		}
 	}
 
-	return c.storage.Insert(doc)
+	// Insert into storage
+	if err := c.storage.Insert(doc); err != nil {
+		return err
+	}
+
+	// Update indexes
+	for field, idx := range c.indexes {
+		if value, exists := doc.Data[field]; exists {
+			idx.Insert(value, doc.ID)
+		}
+	}
+
+	return nil
 }
 
 // Get retrieves a document by ID
@@ -67,6 +141,12 @@ func (c *Collection) Update(doc *document.Document) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Get old document for index updates
+	oldDoc, err := c.storage.Get(doc.ID)
+	if err != nil {
+		return err
+	}
+
 	// Validate against schema if one exists
 	if c.Schema != nil {
 		if err := c.Schema.Validate(doc); err != nil {
@@ -74,7 +154,24 @@ func (c *Collection) Update(doc *document.Document) error {
 		}
 	}
 
-	return c.storage.Update(doc)
+	// Update storage
+	if err := c.storage.Update(doc); err != nil {
+		return err
+	}
+
+	// Update indexes
+	for field, idx := range c.indexes {
+		// Remove old value
+		if oldValue, exists := oldDoc.Data[field]; exists {
+			idx.Delete(oldValue, doc.ID)
+		}
+		// Add new value
+		if newValue, exists := doc.Data[field]; exists {
+			idx.Insert(newValue, doc.ID)
+		}
+	}
+
+	return nil
 }
 
 // Patch partially updates a document
@@ -86,6 +183,14 @@ func (c *Collection) Patch(id string, data map[string]interface{}) (*document.Do
 	doc, err := c.storage.Get(id)
 	if err != nil {
 		return nil, err
+	}
+
+	// Store old values for index updates
+	oldData := make(map[string]interface{})
+	for field := range c.indexes {
+		if value, exists := doc.Data[field]; exists {
+			oldData[field] = value
+		}
 	}
 
 	// Merge the data
@@ -103,6 +208,18 @@ func (c *Collection) Patch(id string, data map[string]interface{}) (*document.Do
 		return nil, err
 	}
 
+	// Update indexes
+	for field, idx := range c.indexes {
+		// Remove old value
+		if oldValue, exists := oldData[field]; exists {
+			idx.Delete(oldValue, doc.ID)
+		}
+		// Add new value
+		if newValue, exists := doc.Data[field]; exists {
+			idx.Insert(newValue, doc.ID)
+		}
+	}
+
 	return doc, nil
 }
 
@@ -111,7 +228,25 @@ func (c *Collection) Delete(id string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	return c.storage.Delete(id)
+	// Get document for index updates
+	doc, err := c.storage.Get(id)
+	if err != nil {
+		return err
+	}
+
+	// Delete from storage
+	if err := c.storage.Delete(id); err != nil {
+		return err
+	}
+
+	// Remove from indexes
+	for field, idx := range c.indexes {
+		if value, exists := doc.Data[field]; exists {
+			idx.Delete(value, id)
+		}
+	}
+
+	return nil
 }
 
 // Find retrieves documents matching a filter
@@ -119,7 +254,42 @@ func (c *Collection) Find(filter map[string]interface{}) ([]*document.Document, 
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
+	// Check if we can use an index
+	for field, value := range filter {
+		if idx, exists := c.indexes[field]; exists {
+			// Use index to find document IDs
+			ids, err := idx.Find(value)
+			if err != nil {
+				continue
+			}
+			// Fetch documents by IDs
+			results := make([]*document.Document, 0, len(ids))
+			for _, id := range ids {
+				doc, err := c.storage.Get(id)
+				if err == nil {
+					// Verify the document still matches the full filter
+					if matchesFilter(doc, filter) {
+						results = append(results, doc)
+					}
+				}
+			}
+			return results, nil
+		}
+	}
+
+	// Fall back to full scan
 	return c.storage.Find(filter)
+}
+
+// matchesFilter checks if a document matches all filter criteria
+func matchesFilter(doc *document.Document, filter map[string]interface{}) bool {
+	for key, value := range filter {
+		docValue, exists := doc.Data[key]
+		if !exists || docValue != value {
+			return false
+		}
+	}
+	return true
 }
 
 // FindAll retrieves all documents
@@ -141,7 +311,18 @@ func (c *Collection) Count() int {
 func (c *Collection) Clear() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.storage.Clear()
+	
+	// Clear storage
+	if err := c.storage.Clear(); err != nil {
+		return err
+	}
+
+	// Clear indexes
+	for _, idx := range c.indexes {
+		idx.Clear()
+	}
+
+	return nil
 }
 
 // SetSchema sets or updates the collection schema
@@ -163,6 +344,13 @@ type collectionMetadata struct {
 	Name      string           `json:"name"`
 	HasSchema bool             `json:"hasSchema"`
 	Schema    *document.Schema `json:"schema,omitempty"`
+	Indexes   []IndexMeta      `json:"indexes,omitempty"`
+}
+
+// IndexMeta represents index metadata for persistence
+type IndexMeta struct {
+	Field string            `json:"field"`
+	Type  storage.IndexType `json:"type"`
 }
 
 // Bucket names
@@ -187,7 +375,7 @@ func NewManager() *Manager {
 	}
 }
 
-// NewPersistentManager creates a new collection manager with BoltDB persistence
+// NewPersistentManager creates a new collection manager with persistence
 func NewPersistentManager(cfg *config.Config) (*Manager, error) {
 	// Open BoltDB database
 	db, err := bolt.Open(cfg.DatabaseFile, 0600, &bolt.Options{
@@ -237,10 +425,41 @@ func (m *Manager) loadCollections() error {
 				return fmt.Errorf("failed to create storage for %s: %w", meta.Name, err)
 			}
 
+			// Wrap with hybrid storage if cache is enabled
+			var finalStore storage.Storage = store
+			if m.config != nil && m.config.CacheEnabled {
+				finalStore = storage.NewHybridStorageWithBoltDB(store, m.config.CacheSizeMB, m.config.CacheEnabled)
+			}
+
 			col := &Collection{
 				Name:    meta.Name,
 				Schema:  meta.Schema,
-				storage: store,
+				storage: finalStore,
+				indexes: make(map[string]storage.Index),
+				manager: m,
+			}
+
+			// Recreate indexes
+			for _, idxMeta := range meta.Indexes {
+				var idx storage.Index
+				switch idxMeta.Type {
+				case storage.IndexTypeBTree:
+					idx = storage.NewBTreeIndex(fmt.Sprintf("%s_%s_idx", meta.Name, idxMeta.Field), idxMeta.Field, 64)
+				case storage.IndexTypeHash:
+					idx = storage.NewHashIndex(fmt.Sprintf("%s_%s_idx", meta.Name, idxMeta.Field), idxMeta.Field)
+				}
+				if idx != nil {
+					// Build index from existing documents
+					docs, err := store.FindAll()
+					if err == nil {
+						for _, doc := range docs {
+							if value, exists := doc.Data[idxMeta.Field]; exists {
+								idx.Insert(value, doc.ID)
+							}
+						}
+					}
+					col.indexes[idxMeta.Field] = idx
+				}
 			}
 
 			m.collections[meta.Name] = col
@@ -274,10 +493,20 @@ func (m *Manager) saveCollections() error {
 
 		// Save all collections
 		for name, col := range m.collections {
+			// Collect index metadata
+			var indexes []IndexMeta
+			for field, idx := range col.indexes {
+				indexes = append(indexes, IndexMeta{
+					Field: field,
+					Type:  idx.Type(),
+				})
+			}
+			
 			meta := collectionMetadata{
 				Name:      name,
 				HasSchema: col.Schema != nil,
 				Schema:    col.Schema,
+				Indexes:   indexes,
 			}
 			data, err := json.Marshal(meta)
 			if err != nil {
@@ -302,17 +531,28 @@ func (m *Manager) CreateCollection(name string, schema *document.Schema) (*Colle
 	}
 
 	var col *Collection
+	
 	if m.db != nil {
 		// Create with BoltDB storage
 		store, err := storage.NewBoltDBStorage(m.db, name)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create storage: %w", err)
 		}
-		col = NewCollectionWithStorage(name, schema, store)
+		
+		// Wrap with hybrid storage if cache is enabled
+		var finalStore storage.Storage = store
+		if m.config != nil && m.config.CacheEnabled {
+			finalStore = storage.NewHybridStorageWithBoltDB(store, m.config.CacheSizeMB, m.config.CacheEnabled)
+		}
+		
+		col = NewCollectionWithStorage(name, schema, finalStore)
 	} else {
 		// Create with memory storage
 		col = NewCollection(name, schema)
 	}
+
+	// Set manager reference for $lookup support
+	col.manager = m
 
 	m.collections[name] = col
 
@@ -343,8 +583,14 @@ func (m *Manager) DropCollection(name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if _, exists := m.collections[name]; !exists {
+	col, exists := m.collections[name]
+	if !exists {
 		return errors.New("collection not found: " + name)
+	}
+
+	// Close storage if it's HybridStorage
+	if hs, ok := col.storage.(*storage.HybridStorage); ok {
+		hs.Close()
 	}
 
 	// Delete bucket if using BoltDB
@@ -407,10 +653,22 @@ func (m *Manager) UpdateSchema(name string, schema *document.Schema) error {
 
 // Close closes the database connection
 func (m *Manager) Close() error {
+	// Close all hybrid storage instances
+	for _, col := range m.collections {
+		if hs, ok := col.storage.(*storage.HybridStorage); ok {
+			hs.Close()
+		}
+	}
+	
 	if m.db != nil {
 		return m.db.Close()
 	}
 	return nil
+}
+
+// GetDB returns the underlying BoltDB instance
+func (m *Manager) GetDB() *bolt.DB {
+	return m.db
 }
 
 // ExportData represents the export format for a collection
@@ -474,24 +732,34 @@ func (m *Manager) ImportCollection(data *ExportData, overwrite bool) error {
 		if err != nil {
 			return fmt.Errorf("failed to create storage: %w", err)
 		}
-		col = NewCollectionWithStorage(data.Name, data.Schema, store)
+		
+		// Wrap with hybrid storage if cache is enabled
+		var finalStore storage.Storage = store
+		if m.config != nil && m.config.CacheEnabled {
+			finalStore = storage.NewHybridStorageWithBoltDB(store, m.config.CacheSizeMB, m.config.CacheEnabled)
+		}
+		
+		col = NewCollectionWithStorage(data.Name, data.Schema, finalStore)
 	} else {
 		col = NewCollection(data.Name, data.Schema)
 	}
 
 	// Import documents
-	if boltStore, ok := col.storage.(*storage.BoltDBStorage); ok {
-		if err := boltStore.ImportDocuments(data.Documents); err != nil {
+	if hybridStore, ok := col.storage.(*storage.HybridStorage); ok {
+		if err := hybridStore.ImportDocuments(data.Documents); err != nil {
 			return fmt.Errorf("failed to import documents: %w", err)
 		}
 	} else {
-		// Fallback for memory storage
+		// Fallback for memory or direct BoltDB storage
 		for _, doc := range data.Documents {
 			if err := col.storage.Insert(doc); err != nil {
 				return fmt.Errorf("failed to import document %s: %w", doc.ID, err)
 			}
 		}
 	}
+
+	// Set manager reference for $lookup support
+	col.manager = m
 
 	m.collections[data.Name] = col
 

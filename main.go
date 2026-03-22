@@ -6,6 +6,7 @@ import (
 	"aidb/internal/collection"
 	"aidb/internal/config"
 	"aidb/internal/rbac"
+	"aidb/internal/vector"
 	"context"
 	"fmt"
 	"log"
@@ -27,6 +28,11 @@ func main() {
 
 	log.Printf("Data directory: %s", cfg.DataDir)
 	log.Printf("Database file: %s", cfg.DatabaseFile)
+	log.Printf("Storage engine: %s", cfg.StorageEngine)
+	log.Printf("Cache enabled: %v, size: %d MB", cfg.CacheEnabled, cfg.CacheSizeMB)
+	if cfg.StorageEngine == "rocksdb" {
+		log.Printf("RocksDB path: %s", cfg.RocksDBPath)
+	}
 
 	// Initialize the collection manager with persistence
 	collectionManager, err := collection.NewPersistentManager(cfg)
@@ -47,8 +53,17 @@ func main() {
 	// Initialize RBAC Enforcer
 	enforcer := rbac.NewEnforcer(collectionManager)
 
+	// Initialize Vector Manager (using the same BoltDB instance)
+	vectorManager, err := vector.NewPersistentVectorManager(collectionManager.GetDB())
+	if err != nil {
+		log.Fatalf("Failed to initialize vector manager: %v", err)
+	}
+
 	// Create the API handler
 	handler := api.NewHandler(collectionManager, authService, enforcer)
+
+	// Create the Vector API handler
+	vectorHandler := api.NewVectorHandler(vectorManager, authService, enforcer)
 
 	// Create a new serve mux
 	mux := http.NewServeMux()
@@ -56,15 +71,34 @@ func main() {
 	// Register all routes
 	handler.RegisterRoutes(mux)
 
+	// Helper to chain middleware
+	protected := func(handlerFunc http.HandlerFunc) http.Handler {
+		return handler.AuthMiddleware(handler.RBACMiddleware(http.HandlerFunc(handlerFunc)))
+	}
+
+	// Register vector routes
+	vectorHandler.RegisterVectorRoutes(mux, protected)
+
+	// WebSocket streaming endpoint
+	mux.HandleFunc("GET /api/v1/ws", api.HandleWebSocket)
+
+	// Query management endpoints
+	mux.HandleFunc("GET /api/v1/queries", api.ListQueries)
+	mux.HandleFunc("GET /api/v1/queries/{id}", api.GetQueryStatus)
+	mux.HandleFunc("POST /api/v1/queries/{id}/cancel", api.CancelQuery)
+
 	// Add a root handler
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{
   "name": "AIDB",
-  "version": "0.3.0",
-  "description": "AI-Native Database with Auth, RBAC & Multi-tenancy",
+  "version": "0.5.0",
+  "description": "AI-Native Database with Auth, RBAC, Multi-tenancy, Vector Support & HNSW Indexing",
   "dataDir": "` + cfg.DataDir + `",
   "database": "` + cfg.DatabaseFile + `",
+  "storageEngine": "` + cfg.StorageEngine + `",
+  "cacheEnabled": ` + fmt.Sprintf("%v", cfg.CacheEnabled) + `,
+  "cacheSizeMB": ` + fmt.Sprintf("%d", cfg.CacheSizeMB) + `,
   "endpoints": {
     "auth": {
       "login": "POST /api/v1/login",
@@ -76,7 +110,8 @@ func main() {
       "list": "GET /api/v1/collections",
       "create": "POST /api/v1/collections",
       "get": "GET /api/v1/collections/{name}",
-      "delete": "DELETE /api/v1/collections/{name}"
+      "delete": "DELETE /api/v1/collections/{name}",
+      "createIndex": "POST /api/v1/collections/{name}/indexes"
     },
     "documents": {
       "insert": "POST /api/v1/collections/{name}/documents",
@@ -94,6 +129,33 @@ func main() {
       "export": "GET /api/v1/collections/{name}/export",
       "export_download": "GET /api/v1/collections/{name}/export?download=true",
       "import": "POST /api/v1/collections/{name}/import?overwrite=true"
+    },
+    "vectors": {
+      "list": "GET /api/v1/vectors",
+      "create": "POST /api/v1/vectors",
+      "get": "GET /api/v1/vectors/{name}",
+      "delete": "DELETE /api/v1/vectors/{name}",
+      "insert_document": "POST /api/v1/vectors/{name}/documents",
+      "list_documents": "GET /api/v1/vectors/{name}/documents",
+      "get_document": "GET /api/v1/vectors/{name}/documents/{id}",
+      "update_document": "PUT /api/v1/vectors/{name}/documents/{id}",
+      "patch_document": "PATCH /api/v1/vectors/{name}/documents/{id}",
+      "delete_document": "DELETE /api/v1/vectors/{name}/documents/{id}",
+      "search": "POST /api/v1/vectors/{name}/search",
+      "export": "GET /api/v1/vectors/{name}/export",
+      "import": "POST /api/v1/vectors/{name}/import"
+    },
+    "websocket": {
+      "connect": "WS /api/v1/ws",
+      "subscribe": "{\"type\": \"subscribe\", \"queryIds\": [\"id1\", \"id2\"]}",
+      "subscribe_all": "{\"type\": \"subscribe_all\"}",
+      "cancel": "{\"type\": \"cancel\", \"queryId\": \"id\"}",
+      "ping": "{\"type\": \"ping\"}"
+    },
+    "queries": {
+      "list": "GET /api/v1/queries",
+      "get": "GET /api/v1/queries/{id}",
+      "cancel": "POST /api/v1/queries/{id}/cancel"
     },
     "health": "GET /api/v1/health"
   }

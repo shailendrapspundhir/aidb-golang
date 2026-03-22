@@ -29,6 +29,42 @@ type Storage interface {
 
 	// Clear removes all documents
 	Clear() error
+
+	// Close closes the storage
+	Close() error
+
+	// Flush flushes data to disk
+	Flush() error
+
+	// GetRaw retrieves raw bytes by ID
+	GetRaw(id string) ([]byte, error)
+
+	// PutRaw stores raw bytes by ID
+	PutRaw(id string, data []byte) error
+
+	// DeleteRaw removes raw bytes by ID
+	DeleteRaw(id string) error
+
+	// ImportDocuments imports multiple documents at once
+	ImportDocuments(docs []*document.Document) error
+
+	// CompactRange compacts the storage for a range
+	CompactRange(start, end string) error
+
+	// Cursor returns an iterator over all documents (streaming, memory-safe)
+	Cursor() (Cursor, error)
+}
+
+// Cursor provides streaming iteration over documents without loading all into memory
+type Cursor interface {
+	// Next advances to the next document; returns false when done or on error
+	Next() bool
+	// Current returns the current document (valid only after Next returns true)
+	Current() *document.Document
+	// Err returns any error encountered during iteration
+	Err() error
+	// Close releases resources held by the cursor
+	Close() error
 }
 
 // StorageError represents an error from the storage engine

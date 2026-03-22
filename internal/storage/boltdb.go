@@ -237,3 +237,136 @@ func (s *BoltDBStorage) ImportDocuments(docs []*document.Document) error {
 		return nil
 	})
 }
+
+// Close closes the storage (BoltDB is closed by the manager)
+func (s *BoltDBStorage) Close() error {
+	return nil
+}
+
+// Flush flushes data to disk
+func (s *BoltDBStorage) Flush() error {
+	// BoltDB auto-flushes, but we can force a sync
+	return nil
+}
+
+// GetRaw retrieves raw bytes by ID
+func (s *BoltDBStorage) GetRaw(id string) ([]byte, error) {
+	var data []byte
+
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(s.bucketName)
+		if b == nil {
+			return fmt.Errorf("bucket not found: %s", s.collectionName)
+		}
+
+		v := b.Get([]byte(id))
+		if v == nil {
+			return ErrDocumentNotFound
+		}
+
+		// Copy the data since it's only valid within the transaction
+		data = make([]byte, len(v))
+		copy(data, v)
+		return nil
+	})
+
+	return data, err
+}
+
+// PutRaw stores raw bytes by ID
+func (s *BoltDBStorage) PutRaw(id string, data []byte) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(s.bucketName)
+		if b == nil {
+			return fmt.Errorf("bucket not found: %s", s.collectionName)
+		}
+		return b.Put([]byte(id), data)
+	})
+}
+
+// DeleteRaw removes raw bytes by ID
+func (s *BoltDBStorage) DeleteRaw(id string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket(s.bucketName)
+		if b == nil {
+			return fmt.Errorf("bucket not found: %s", s.collectionName)
+		}
+		return b.Delete([]byte(id))
+	})
+}
+
+// CompactRange compacts the storage (no-op for BoltDB)
+func (s *BoltDBStorage) CompactRange(start, end string) error {
+	return nil
+}
+
+// boltCursor implements Cursor for BoltDBStorage
+type boltCursor struct {
+	storage  *BoltDBStorage
+	keys     [][]byte
+	index    int
+	current  *document.Document
+	err      error
+	closed   bool
+}
+
+// Cursor returns a streaming iterator over all documents
+func (s *BoltDBStorage) Cursor() (Cursor, error) {
+	var keys [][]byte
+	err := s.db.View(func(tx *bolt.Tx) error {
+		b := tx.Bucket(s.bucketName)
+		if b == nil {
+			return fmt.Errorf("bucket not found: %s", s.collectionName)
+		}
+		return b.ForEach(func(k, v []byte) error {
+			// Copy key (k is only valid during ForEach)
+			keyCopy := make([]byte, len(k))
+			copy(keyCopy, k)
+			keys = append(keys, keyCopy)
+			return nil
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return &boltCursor{
+		storage: s,
+		keys:    keys,
+		index:   -1,
+	}, nil
+}
+
+func (c *boltCursor) Next() bool {
+	if c.closed || c.err != nil {
+		return false
+	}
+	c.index++
+	if c.index >= len(c.keys) {
+		c.current = nil
+		return false
+	}
+
+	doc, err := c.storage.Get(string(c.keys[c.index]))
+	if err != nil {
+		c.err = err
+		c.current = nil
+		return false
+	}
+	c.current = doc
+	return true
+}
+
+func (c *boltCursor) Current() *document.Document {
+	return c.current
+}
+
+func (c *boltCursor) Err() error {
+	return c.err
+}
+
+func (c *boltCursor) Close() error {
+	c.closed = true
+	c.current = nil
+	return nil
+}

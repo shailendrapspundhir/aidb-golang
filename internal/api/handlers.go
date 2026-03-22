@@ -37,6 +37,10 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/v1/register", h.Register)
 	mux.HandleFunc("GET /api/v1/health", h.HealthCheck)
 
+	// Swagger documentation routes (public)
+	mux.HandleFunc("GET /api/v1/swagger.json", HandleSwaggerJSON)
+	mux.HandleFunc("GET /api/v1/docs", HandleSwaggerUI)
+
 	// Protected routes
 	// We wrap these with AuthMiddleware and RBACMiddleware
 	
@@ -62,6 +66,16 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	// Schema routes
 	mux.Handle("GET /api/v1/collections/{name}/schema", protected(h.GetSchema))
 	mux.Handle("PUT /api/v1/collections/{name}/schema", protected(h.SetSchema))
+
+	// Index routes
+	mux.Handle("POST /api/v1/collections/{name}/indexes", protected(h.CreateIndex))
+	mux.Handle("GET /api/v1/collections/{name}/indexes", protected(h.ListIndexes))
+	mux.Handle("DELETE /api/v1/collections/{name}/indexes/{field}", protected(h.DropIndex))
+
+	// Aggregation routes
+	mux.Handle("POST /api/v1/collections/{name}/aggregate", protected(h.handleAggregation))
+	mux.Handle("GET /api/v1/collections/{name}/distinct/{field}", protected(h.handleDistinct))
+	mux.Handle("GET /api/v1/collections/{name}/stats", protected(h.handleStats))
 
 	// Export/Import routes
 	mux.Handle("GET /api/v1/collections/{name}/export", protected(h.ExportCollection))
@@ -830,5 +844,108 @@ func (h *Handler) ImportCollection(w http.ResponseWriter, r *http.Request) {
 		"name":          importData.Name,
 		"documentCount": len(importData.Documents),
 		"hasSchema":     importData.HasSchema,
+	})
+}
+
+// Index Handlers
+
+// CreateIndexRequest represents a request to create an index
+type CreateIndexRequest struct {
+	Field string          `json:"field"`
+	Type  storage.IndexType `json:"type"`
+}
+
+// CreateIndex creates an index on a collection field
+func (h *Handler) CreateIndex(w http.ResponseWriter, r *http.Request) {
+	collectionName := r.PathValue("name")
+	col, err := h.collectionManager.GetCollection(collectionName)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	var req CreateIndexRequest
+	if err := parseJSONBody(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+
+	if req.Field == "" {
+		writeError(w, http.StatusBadRequest, "field is required")
+		return
+	}
+
+	if req.Type == "" {
+		req.Type = storage.IndexTypeBTree // Default to B-tree
+	}
+
+	if err := col.CreateIndex(req.Field, req.Type); err != nil {
+		if strings.Contains(err.Error(), "already exists") {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to create index: "+err.Error())
+		return
+	}
+
+	writeSuccess(w, map[string]interface{}{
+		"message":     "index created successfully",
+		"collection":  collectionName,
+		"field":       req.Field,
+		"indexType":   req.Type,
+	})
+}
+
+// ListIndexes lists all indexes on a collection
+func (h *Handler) ListIndexes(w http.ResponseWriter, r *http.Request) {
+	collectionName := r.PathValue("name")
+	col, err := h.collectionManager.GetCollection(collectionName)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	indexes := col.GetIndexes()
+	indexList := make([]map[string]interface{}, 0, len(indexes))
+	for field, idx := range indexes {
+		indexList = append(indexList, map[string]interface{}{
+			"field":     field,
+			"type":      idx.Type(),
+			"name":      idx.Name(),
+			"entryCount": idx.Count(),
+		})
+	}
+
+	writeSuccess(w, map[string]interface{}{
+		"collection": collectionName,
+		"indexes":    indexList,
+		"count":      len(indexList),
+	})
+}
+
+// DropIndex drops an index from a collection
+func (h *Handler) DropIndex(w http.ResponseWriter, r *http.Request) {
+	collectionName := r.PathValue("name")
+	field := r.PathValue("field")
+
+	col, err := h.collectionManager.GetCollection(collectionName)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	if err := col.DropIndex(field); err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to drop index: "+err.Error())
+		return
+	}
+
+	writeSuccess(w, map[string]interface{}{
+		"message":    "index dropped successfully",
+		"collection": collectionName,
+		"field":      field,
 	})
 }
