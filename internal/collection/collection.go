@@ -3,6 +3,7 @@ package collection
 import (
 	"aidb/internal/config"
 	"aidb/internal/document"
+	"aidb/internal/fulltext"
 	"aidb/internal/storage"
 	"encoding/json"
 	"errors"
@@ -21,6 +22,10 @@ type Collection struct {
 	indexes map[string]storage.Index // field -> index
 	manager *Manager                  // Reference to manager for $lookup cross-collection queries
 	mu      sync.RWMutex
+
+	// Full-text search
+	fulltextIndex  *fulltext.InvertedIndex
+	fulltextFields []string // fields to index for full-text search
 }
 
 // NewCollection creates a new collection with memory storage
@@ -101,6 +106,117 @@ func (c *Collection) GetIndexes() map[string]storage.Index {
 	return result
 }
 
+// CreateFullTextIndex creates a full-text index on specified fields.
+// The index will be built from existing documents and updated on future CRUD operations.
+func (c *Collection) CreateFullTextIndex(fields []string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if len(fields) == 0 {
+		return fmt.Errorf("at least one field is required for full-text index")
+	}
+
+	if c.fulltextIndex == nil {
+		c.fulltextIndex = fulltext.NewInvertedIndex()
+	}
+
+	c.fulltextFields = make([]string, len(fields))
+	copy(c.fulltextFields, fields)
+
+	// Build index from existing documents
+	docs, err := c.storage.FindAll()
+	if err != nil {
+		return fmt.Errorf("failed to build full-text index: %w", err)
+	}
+
+	for _, doc := range docs {
+		c.indexDocForFullTextLocked(doc)
+	}
+
+	return nil
+}
+
+// GetFullTextIndex returns the full-text index (nil if not created).
+func (c *Collection) GetFullTextIndex() *fulltext.InvertedIndex {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.fulltextIndex
+}
+
+// GetFullTextFields returns the fields indexed for full-text search.
+func (c *Collection) GetFullTextFields() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	result := make([]string, len(c.fulltextFields))
+	copy(result, c.fulltextFields)
+	return result
+}
+
+// ClearFullTextIndex removes the full-text index from the collection.
+func (c *Collection) ClearFullTextIndex() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.fulltextIndex != nil {
+		c.fulltextIndex.Clear()
+	}
+	c.fulltextIndex = nil
+	c.fulltextFields = nil
+}
+
+// RebuildFullTextIndex rebuilds the full-text index from all documents.
+func (c *Collection) RebuildFullTextIndex() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if len(c.fulltextFields) == 0 {
+		return fmt.Errorf("no full-text index fields configured")
+	}
+
+	if c.fulltextIndex == nil {
+		c.fulltextIndex = fulltext.NewInvertedIndex()
+	} else {
+		c.fulltextIndex.Clear()
+	}
+
+	docs, err := c.storage.FindAll()
+	if err != nil {
+		return err
+	}
+
+	for _, doc := range docs {
+		c.indexDocForFullTextLocked(doc)
+	}
+
+	return nil
+}
+
+// indexDocForFullTextLocked indexes a document's text fields (caller must hold lock).
+func (c *Collection) indexDocForFullTextLocked(doc *document.Document) {
+	if c.fulltextIndex == nil || len(c.fulltextFields) == 0 {
+		return
+	}
+
+	values := make([]string, 0, len(c.fulltextFields))
+	for _, field := range c.fulltextFields {
+		if val, exists := doc.Data[field]; exists {
+			switch v := val.(type) {
+			case string:
+				values = append(values, v)
+			case []interface{}:
+				// Concatenate array elements
+				for _, elem := range v {
+					if s, ok := elem.(string); ok {
+						values = append(values, s)
+					}
+				}
+			}
+		}
+	}
+	if len(values) > 0 {
+		c.fulltextIndex.IndexDocument(doc.ID, values)
+	}
+}
+
 // Insert stores a new document in the collection
 func (c *Collection) Insert(doc *document.Document) error {
 	c.mu.Lock()
@@ -124,6 +240,9 @@ func (c *Collection) Insert(doc *document.Document) error {
 			idx.Insert(value, doc.ID)
 		}
 	}
+
+	// Update full-text index
+	c.indexDocForFullTextLocked(doc)
 
 	return nil
 }
@@ -169,6 +288,11 @@ func (c *Collection) Update(doc *document.Document) error {
 		if newValue, exists := doc.Data[field]; exists {
 			idx.Insert(newValue, doc.ID)
 		}
+	}
+
+	// Update full-text index (reindex the document)
+	if c.fulltextIndex != nil {
+		c.indexDocForFullTextLocked(doc)
 	}
 
 	return nil
@@ -244,6 +368,11 @@ func (c *Collection) Delete(id string) error {
 		if value, exists := doc.Data[field]; exists {
 			idx.Delete(value, id)
 		}
+	}
+
+	// Remove from full-text index
+	if c.fulltextIndex != nil {
+		c.fulltextIndex.RemoveDocument(id)
 	}
 
 	return nil
@@ -341,10 +470,11 @@ func (c *Collection) GetSchema() *document.Schema {
 
 // collectionMetadata represents persisted collection info
 type collectionMetadata struct {
-	Name      string           `json:"name"`
-	HasSchema bool             `json:"hasSchema"`
-	Schema    *document.Schema `json:"schema,omitempty"`
-	Indexes   []IndexMeta      `json:"indexes,omitempty"`
+	Name           string           `json:"name"`
+	HasSchema      bool             `json:"hasSchema"`
+	Schema         *document.Schema `json:"schema,omitempty"`
+	Indexes        []IndexMeta      `json:"indexes,omitempty"`
+	FulltextFields []string         `json:"fulltextFields,omitempty"` // fields indexed for full-text search
 }
 
 // IndexMeta represents index metadata for persistence
@@ -432,11 +562,23 @@ func (m *Manager) loadCollections() error {
 			}
 
 			col := &Collection{
-				Name:    meta.Name,
-				Schema:  meta.Schema,
-				storage: finalStore,
-				indexes: make(map[string]storage.Index),
-				manager: m,
+				Name:           meta.Name,
+				Schema:         meta.Schema,
+				storage:        finalStore,
+				indexes:        make(map[string]storage.Index),
+				manager:        m,
+				fulltextFields: meta.FulltextFields,
+			}
+
+			// Recreate full-text index if fields were indexed
+			if len(meta.FulltextFields) > 0 {
+				col.fulltextIndex = fulltext.NewInvertedIndex()
+				docs, err := store.FindAll()
+				if err == nil {
+					for _, doc := range docs {
+						col.indexDocForFullTextLocked(doc)
+					}
+				}
 			}
 
 			// Recreate indexes
@@ -503,10 +645,11 @@ func (m *Manager) saveCollections() error {
 			}
 			
 			meta := collectionMetadata{
-				Name:      name,
-				HasSchema: col.Schema != nil,
-				Schema:    col.Schema,
-				Indexes:   indexes,
+				Name:           name,
+				HasSchema:      col.Schema != nil,
+				Schema:         col.Schema,
+				Indexes:        indexes,
+				FulltextFields: col.GetFullTextFields(),
 			}
 			data, err := json.Marshal(meta)
 			if err != nil {

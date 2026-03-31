@@ -4,6 +4,7 @@ import (
 	"aidb/internal/auth"
 	"aidb/internal/collection"
 	"aidb/internal/document"
+	"aidb/internal/fulltext"
 	"aidb/internal/rbac"
 	"aidb/internal/storage"
 	"encoding/json"
@@ -71,6 +72,13 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/v1/collections/{name}/indexes", protected(h.CreateIndex))
 	mux.Handle("GET /api/v1/collections/{name}/indexes", protected(h.ListIndexes))
 	mux.Handle("DELETE /api/v1/collections/{name}/indexes/{field}", protected(h.DropIndex))
+
+	// Full-text search routes
+	mux.Handle("GET /api/v1/collections/{name}/fulltext-index", protected(h.GetFullTextIndex))
+	mux.Handle("POST /api/v1/collections/{name}/fulltext-index", protected(h.CreateFullTextIndex))
+	mux.Handle("DELETE /api/v1/collections/{name}/fulltext-index", protected(h.DeleteFullTextIndex))
+	mux.Handle("POST /api/v1/collections/{name}/fulltext-index/rebuild", protected(h.RebuildFullTextIndex))
+	mux.Handle("POST /api/v1/collections/{name}/search", protected(h.FullTextSearch))
 
 	// Aggregation routes
 	mux.Handle("POST /api/v1/collections/{name}/aggregate", protected(h.handleAggregation))
@@ -947,5 +955,403 @@ func (h *Handler) DropIndex(w http.ResponseWriter, r *http.Request) {
 		"message":    "index dropped successfully",
 		"collection": collectionName,
 		"field":      field,
+	})
+}
+
+// FullTextSearchRequest represents a full-text search request.
+// Supports both simple query string and JSON-based structured query (like aggregation $match).
+type FullTextSearchRequest struct {
+	// Simple query string (backward compatible)
+	Query string `json:"q"`
+
+	// Structured JSON query (like aggregation $match operators)
+	// Supports: $text, $regex, $phrase, $fuzzy, $caseSensitive
+	QueryObject map[string]interface{} `json:"query,omitempty"`
+
+	// Pagination
+	Limit  int `json:"limit,omitempty"`
+	Offset int `json:"offset,omitempty"` // Number of results to skip (for pagination)
+
+	// Search options
+	Phrase        bool `json:"phrase,omitempty"`        // If true, require terms to be adjacent (phrase search)
+	Fuzzy         bool `json:"fuzzy,omitempty"`         // If true, use fuzzy matching (edit distance)
+	MaxFuzzyDist  int  `json:"maxFuzzyDist,omitempty"`  // Max edit distance for fuzzy (default 2)
+	CaseSensitive bool `json:"caseSensitive,omitempty"` // If true, preserve case (default false = case-insensitive)
+
+	// Field-specific search (optional filter)
+	Fields []string `json:"fields,omitempty"` // If specified, search only within these fields
+}
+
+// FullTextSearch performs a full-text search on a collection.
+// Supports both simple query string (q) and JSON-based structured query (query object).
+// JSON query supports operators: $text, $regex, $phrase, $fuzzy, $caseSensitive
+func (h *Handler) FullTextSearch(w http.ResponseWriter, r *http.Request) {
+	collectionName := r.PathValue("name")
+
+	col, err := h.collectionManager.GetCollection(collectionName)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	var req FullTextSearchRequest
+	if err := parseJSONBody(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+
+	// Parse QueryObject if provided (JSON-based query like aggregation $match)
+	var regexPattern string
+	if req.QueryObject != nil {
+		// Extract $text as alternative to q
+		if text, ok := req.QueryObject["$text"].(string); ok && req.Query == "" {
+			req.Query = text
+		}
+		// Extract $regex pattern
+		if regex, ok := req.QueryObject["$regex"].(string); ok {
+			regexPattern = regex
+		} else if regexMap, ok := req.QueryObject["$regex"].(map[string]interface{}); ok {
+			// Support $regex: {"field": "pattern"} - use first pattern found
+			for _, v := range regexMap {
+				if s, ok := v.(string); ok {
+					regexPattern = s
+					break
+				}
+			}
+		}
+		// Extract $phrase
+		if phrase, ok := req.QueryObject["$phrase"].(bool); ok {
+			req.Phrase = phrase
+		}
+		// Extract $fuzzy
+		if fuzzy, ok := req.QueryObject["$fuzzy"].(bool); ok {
+			req.Fuzzy = fuzzy
+		}
+		// Extract $caseSensitive
+		if cs, ok := req.QueryObject["$caseSensitive"].(bool); ok {
+			req.CaseSensitive = cs
+		}
+	}
+
+	// Require either q or $text from query object
+	if req.Query == "" && regexPattern == "" {
+		writeError(w, http.StatusBadRequest, "query 'q' or 'query.$text' or 'query.$regex' is required")
+		return
+	}
+
+	if req.Limit <= 0 {
+		req.Limit = 20
+	}
+
+	idx := col.GetFullTextIndex()
+	if idx == nil {
+		writeError(w, http.StatusBadRequest, "no full-text index exists on this collection; create one first")
+		return
+	}
+
+	// Build analyzer based on case sensitivity
+	var analyzer *fulltext.Analyzer
+	if req.CaseSensitive {
+		analyzer = fulltext.NewAnalyzer(fulltext.WithCaseSensitive())
+	} else {
+		analyzer = fulltext.StandardAnalyzer()
+	}
+
+	// Handle regex-only search (no text terms)
+	if req.Query == "" && regexPattern != "" {
+		candidates := idx.RegexSearch(regexPattern)
+		if len(candidates) == 0 {
+			writeSuccess(w, map[string]interface{}{
+				"results": []interface{}{},
+				"count":   0,
+				"query":   map[string]interface{}{"$regex": regexPattern},
+			})
+			return
+		}
+		// Score: use simple term frequency as score for regex
+		results := make([]fulltext.ScoredResult, 0, len(candidates))
+		for docID, score := range candidates {
+			results = append(results, fulltext.ScoredResult{DocID: docID, Score: score})
+		}
+		// Sort by score descending
+		sortSearchResults(results)
+
+		// Apply offset (pagination)
+		if req.Offset > 0 && req.Offset < len(results) {
+			results = results[req.Offset:]
+		} else if req.Offset >= len(results) {
+			results = nil
+		}
+
+		// Apply limit
+		if len(results) > req.Limit {
+			results = results[:req.Limit]
+		}
+
+		searchResults := make([]map[string]interface{}, 0, len(results))
+		for _, res := range results {
+			doc, err := col.Get(res.DocID)
+			if err != nil {
+				continue
+			}
+			searchResults = append(searchResults, map[string]interface{}{
+				"document": doc,
+				"score":    res.Score,
+			})
+		}
+		writeSuccess(w, map[string]interface{}{
+			"results": searchResults,
+			"count":   len(searchResults),
+			"query":   map[string]interface{}{"$regex": regexPattern},
+		})
+		return
+	}
+
+	terms := analyzer.Analyze(req.Query)
+	if len(terms) == 0 {
+		writeSuccess(w, map[string]interface{}{
+			"results": []interface{}{},
+			"count":   0,
+			"query":   req.Query,
+		})
+		return
+	}
+
+	// Get candidate docs based on search type
+	var candidates map[string]float64
+	if req.Phrase {
+		candidates = idx.PhraseSearch(terms)
+	} else if req.Fuzzy {
+		maxDist := req.MaxFuzzyDist
+		if maxDist <= 0 {
+			maxDist = 2
+		}
+		candidates = idx.FuzzySearch(terms, maxDist)
+	} else {
+		candidates = idx.SearchTerms(terms)
+	}
+
+	// If regex pattern provided, intersect with term search results
+	if regexPattern != "" {
+		regexCandidates := idx.RegexSearch(regexPattern)
+		// Intersect: keep only docs in both sets
+		intersected := make(map[string]float64)
+		for docID, score := range candidates {
+			if regexScore, ok := regexCandidates[docID]; ok {
+				intersected[docID] = score + regexScore
+			}
+		}
+		candidates = intersected
+	}
+
+	// Score with BM25
+	scorer := fulltext.NewBM25Scorer()
+	results := scorer.ScoreDocuments(candidates, idx, terms)
+
+	// Apply offset (pagination)
+	if req.Offset > 0 && req.Offset < len(results) {
+		results = results[req.Offset:]
+	} else if req.Offset >= len(results) {
+		// Offset beyond results
+		results = nil
+	}
+
+	// Apply limit
+	if len(results) > req.Limit {
+		results = results[:req.Limit]
+	}
+
+	// Fetch documents and build response
+	searchResults := make([]map[string]interface{}, 0, len(results))
+	for _, res := range results {
+		doc, err := col.Get(res.DocID)
+		if err != nil {
+			continue
+		}
+		// Apply field filter if specified
+		if len(req.Fields) > 0 && !docMatchesFields(doc, terms, req.Fields) {
+			continue
+		}
+		searchResults = append(searchResults, map[string]interface{}{
+			"document": doc,
+			"score":    res.Score,
+		})
+	}
+
+	writeSuccess(w, map[string]interface{}{
+		"results": searchResults,
+		"count":   len(searchResults),
+		"query":   req.Query,
+	})
+}
+
+// docMatchesFields checks if any of the query terms appear in the specified fields of the document.
+func docMatchesFields(doc *document.Document, terms []string, fields []string) bool {
+	if doc == nil || len(terms) == 0 || len(fields) == 0 {
+		return true // no filter
+	}
+	for _, field := range fields {
+		val, exists := doc.Data[field]
+		if !exists {
+			continue
+		}
+		var text string
+		switch v := val.(type) {
+		case string:
+			text = v
+		case []interface{}:
+			for _, elem := range v {
+				if s, ok := elem.(string); ok {
+					text += " " + s
+				}
+			}
+		default:
+			continue
+		}
+		// Normalize text to lowercase for matching (case-insensitive check)
+		textLower := strings.ToLower(text)
+		for _, term := range terms {
+			if strings.Contains(textLower, strings.ToLower(term)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sortSearchResults sorts search results by score descending (simple insertion sort for small arrays)
+func sortSearchResults(results []fulltext.ScoredResult) {
+	for i := 1; i < len(results); i++ {
+		j := i
+		for j > 0 && results[j].Score > results[j-1].Score {
+			results[j], results[j-1] = results[j-1], results[j]
+			j--
+		}
+	}
+}
+
+// CreateFullTextIndexRequest represents a request to create a full-text index.
+type CreateFullTextIndexRequest struct {
+	Fields []string `json:"fields"`
+}
+
+// CreateFullTextIndex creates a full-text index on specified fields.
+func (h *Handler) CreateFullTextIndex(w http.ResponseWriter, r *http.Request) {
+	collectionName := r.PathValue("name")
+
+	col, err := h.collectionManager.GetCollection(collectionName)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	var req CreateFullTextIndexRequest
+	if err := parseJSONBody(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+
+	if len(req.Fields) == 0 {
+		writeError(w, http.StatusBadRequest, "fields array is required")
+		return
+	}
+
+	if err := col.CreateFullTextIndex(req.Fields); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create full-text index: "+err.Error())
+		return
+	}
+
+	writeSuccess(w, map[string]interface{}{
+		"message":    "full-text index created successfully",
+		"collection": collectionName,
+		"fields":     req.Fields,
+	})
+}
+
+// GetFullTextIndex returns information about the full-text index on a collection.
+func (h *Handler) GetFullTextIndex(w http.ResponseWriter, r *http.Request) {
+	collectionName := r.PathValue("name")
+
+	col, err := h.collectionManager.GetCollection(collectionName)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	idx := col.GetFullTextIndex()
+	fields := col.GetFullTextFields()
+
+	if idx == nil || len(fields) == 0 {
+		writeSuccess(w, map[string]interface{}{
+			"collection": collectionName,
+			"exists":     false,
+			"fields":     []string{},
+			"termCount":  0,
+			"docCount":   0,
+		})
+		return
+	}
+
+	writeSuccess(w, map[string]interface{}{
+		"collection": collectionName,
+		"exists":     true,
+		"fields":     fields,
+		"termCount":  len(idx.Terms()),
+		"docCount":   idx.TotalDocs(),
+	})
+}
+
+// DeleteFullTextIndex removes the full-text index from a collection.
+func (h *Handler) DeleteFullTextIndex(w http.ResponseWriter, r *http.Request) {
+	collectionName := r.PathValue("name")
+
+	col, err := h.collectionManager.GetCollection(collectionName)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	idx := col.GetFullTextIndex()
+	if idx == nil {
+		writeError(w, http.StatusNotFound, "no full-text index exists on this collection")
+		return
+	}
+
+	// Clear the fulltext index
+	col.ClearFullTextIndex()
+
+	writeSuccess(w, map[string]interface{}{
+		"message":    "full-text index deleted successfully",
+		"collection": collectionName,
+	})
+}
+
+// RebuildFullTextIndex rebuilds the full-text index from all documents in the collection.
+func (h *Handler) RebuildFullTextIndex(w http.ResponseWriter, r *http.Request) {
+	collectionName := r.PathValue("name")
+
+	col, err := h.collectionManager.GetCollection(collectionName)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	fields := col.GetFullTextFields()
+	if len(fields) == 0 {
+		writeError(w, http.StatusBadRequest, "no full-text index fields configured; create an index first")
+		return
+	}
+
+	// Rebuild from all documents
+	if err := col.RebuildFullTextIndex(); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to rebuild index: "+err.Error())
+		return
+	}
+
+	writeSuccess(w, map[string]interface{}{
+		"message":    "full-text index rebuilt successfully",
+		"collection": collectionName,
+		"fields":     fields,
+		"docCount":   col.GetFullTextIndex().TotalDocs(),
 	})
 }

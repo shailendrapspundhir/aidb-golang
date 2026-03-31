@@ -1581,6 +1581,246 @@ const openAPISpec = `{
         }
       }
     },
+    "/collections/{name}/fulltext-index": {
+      "get": {
+        "tags": ["Fulltext"],
+        "summary": "Get full-text index info",
+        "description": "Returns information about the full-text index on a collection including indexed fields, term count, and document count.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "string"}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Full-text index info",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {"type": "boolean"},
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "collection": {"type": "string"},
+                        "exists": {"type": "boolean"},
+                        "fields": {
+                          "type": "array",
+                          "items": {"type": "string"}
+                        },
+                        "termCount": {"type": "integer"},
+                        "docCount": {"type": "integer"}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Collection not found",
+            "content": {
+              "application/json": {"$ref": "#/components/schemas/Error"}
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": ["Fulltext"],
+        "summary": "Create full-text index",
+        "description": "Creates a full-text index on specified fields for search capabilities. The index enables fast text search using BM25 scoring.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "string"}
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["fields"],
+                "properties": {
+                  "fields": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Fields to index for full-text search"
+                  }
+                }
+              },
+              "example": {
+                "fields": ["title", "content", "description"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Full-text index created",
+            "content": {
+              "application/json": {"$ref": "#/components/schemas/Success"}
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {"$ref": "#/components/schemas/Error"}
+          }
+        }
+      },
+      "delete": {
+        "tags": ["Fulltext"],
+        "summary": "Delete full-text index",
+        "description": "Removes the full-text index from a collection.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "string"}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Full-text index deleted",
+            "content": {"$ref": "#/components/schemas/Success"}
+          },
+          "404": {
+            "description": "No full-text index exists",
+            "content": {"$ref": "#/components/schemas/Error"}
+          }
+        }
+      }
+    },
+    "/collections/{name}/fulltext-index/rebuild": {
+      "post": {
+        "tags": ["Fulltext"],
+        "summary": "Rebuild full-text index",
+        "description": "Rebuilds the full-text index from all documents in the collection. Useful after bulk imports or data changes.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "string"}
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Full-text index rebuilt",
+            "content": {"$ref": "#/components/schemas/Success"}
+          },
+          "400": {
+            "description": "No full-text index fields configured",
+            "content": {"$ref": "#/components/schemas/Error"}
+          }
+        }
+      }
+    },
+    "/collections/{name}/search": {
+      "post": {
+        "tags": ["Fulltext"],
+        "summary": "Full-text search",
+        "description": "Performs full-text search on a collection using BM25 scoring. Supports simple query strings and JSON-based structured queries with operators like $text, $regex, $phrase, $fuzzy, $caseSensitive.",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {"type": "string"}
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "q": {
+                    "type": "string",
+                    "description": "Simple query string (backward compatible)"
+                  },
+                  "query": {
+                    "type": "object",
+                    "description": "JSON-based structured query (like aggregation $match). Supports $text, $regex, $phrase, $fuzzy, $caseSensitive",
+                    "properties": {
+                      "$text": {"type": "string", "description": "Text to search for"},
+                      "$regex": {"oneOf": [{"type": "string"}, {"type": "object"}], "description": "Regex pattern or field->pattern map"},
+                      "$phrase": {"type": "boolean", "description": "Require terms to be adjacent (phrase search)"},
+                      "$fuzzy": {"type": "boolean", "description": "Use fuzzy matching (edit distance)"},
+                      "$caseSensitive": {"type": "boolean", "description": "Preserve case (default false)"}
+                    }
+                  },
+                  "limit": {"type": "integer", "default": 20},
+                  "phrase": {"type": "boolean", "description": "Phrase search (top-level)"},
+                  "fuzzy": {"type": "boolean", "description": "Fuzzy search (top-level)"},
+                  "maxFuzzyDist": {"type": "integer", "description": "Max edit distance for fuzzy (default 2)"},
+                  "caseSensitive": {"type": "boolean", "description": "Case sensitive (top-level)"}
+                }
+              },
+              "examples": {
+                "simple": {
+                  "summary": "Simple query",
+                  "value": {"q": "hello world", "limit": 10}
+                },
+                "structured": {
+                  "summary": "JSON query with operators",
+                  "value": {"query": {"$text": "database", "$regex": "sql.*nosql", "$phrase": false, "$fuzzy": true}, "limit": 20}
+                },
+                "regexOnly": {
+                  "summary": "Regex-only search",
+                  "value": {"query": {"$regex": "^test.*"}}
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Search results",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {"type": "boolean"},
+                    "data": {
+                      "type": "object",
+                      "properties": {
+                        "results": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "document": {"type": "object"},
+                              "score": {"type": "number"}
+                            }
+                          }
+                        },
+                        "count": {"type": "integer"},
+                        "query": {"type": "string"}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request or no index",
+            "content": {"$ref": "#/components/schemas/Error"}
+          }
+        }
+      }
+    },
     "/collections/{name}/schema": {
       "get": {
         "tags": ["Schema"],
