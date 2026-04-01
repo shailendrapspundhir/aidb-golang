@@ -100,6 +100,118 @@ func TestTransactionBasics(t *testing.T) {
 	})
 }
 
+// ---------------------------------------------------------------------------
+// Deferred-write buffer tests
+// ---------------------------------------------------------------------------
+
+func TestGetFromWriteBuffer(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "writebuf_test")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	walConfig := &wal.Config{
+		Directory:   tmpDir + "/wal",
+		SegmentSize: 10 * 1024 * 1024,
+		SyncPolicy:  wal.SyncOnCommit,
+		MaxSegments: 10,
+	}
+	w, err := wal.NewFileWAL(walConfig)
+	if err != nil {
+		t.Fatalf("Failed to create WAL: %v", err)
+	}
+	defer w.Close()
+
+	tmConfig := &ManagerConfig{
+		DefaultIsolation:      ReadCommitted,
+		DefaultTimeout:        5 * time.Second,
+		MaxActiveTransactions: 100,
+		AutoCommitEnabled:     true,
+	}
+	tm := NewManager(w, tmConfig)
+	defer tm.Close()
+
+	t.Run("NotFound", func(t *testing.T) {
+		tx, _ := tm.Begin()
+		defer tm.Rollback(tx)
+
+		doc, deleted, found := tx.GetFromWriteBuffer("col", "missing")
+		if found {
+			t.Error("Expected not found for empty buffer")
+		}
+		if deleted {
+			t.Error("Expected deleted=false")
+		}
+		if doc != nil {
+			t.Error("Expected nil doc")
+		}
+	})
+
+	t.Run("InsertThenRead", func(t *testing.T) {
+		tx, _ := tm.Begin()
+		defer tm.Rollback(tx)
+
+		doc := &document.Document{
+			ID:   "doc1",
+			Data: map[string]interface{}{"name": "Alice"},
+		}
+		op := Operation{
+			Type:       OpInsert,
+			Collection: "users",
+			DocumentID: doc.ID,
+			NewValue:   doc,
+		}
+		if err := tx.AddOperation(op); err != nil {
+			t.Fatalf("AddOperation failed: %v", err)
+		}
+
+		got, deleted, found := tx.GetFromWriteBuffer("users", "doc1")
+		if !found {
+			t.Fatal("Expected document found in buffer")
+		}
+		if deleted {
+			t.Fatal("Expected deleted=false")
+		}
+		if got.ID != "doc1" {
+			t.Errorf("Expected ID doc1, got %s", got.ID)
+		}
+		if got.Data["name"] != "Alice" {
+			t.Errorf("Expected name=Alice, got %v", got.Data["name"])
+		}
+
+		// Modify the returned copy — original buffer must be untouched
+		got.Data["name"] = "Bob"
+		got2, _, _ := tx.GetFromWriteBuffer("users", "doc1")
+		if got2.Data["name"] != "Alice" {
+			t.Errorf("Buffer was corrupted: expected Alice, got %v", got2.Data["name"])
+		}
+	})
+
+	t.Run("DeleteThenRead", func(t *testing.T) {
+		tx, _ := tm.Begin()
+		defer tm.Rollback(tx)
+
+		op := Operation{
+			Type:       OpDelete,
+			Collection: "users",
+			DocumentID: "doc2",
+			OldValue:   &document.Document{ID: "doc2"},
+		}
+		if err := tx.AddOperation(op); err != nil {
+			t.Fatalf("AddOperation failed: %v", err)
+		}
+
+		_, deleted, found := tx.GetFromWriteBuffer("users", "doc2")
+		if !found {
+			t.Fatal("Expected found=true for deleted doc")
+		}
+		if !deleted {
+			t.Fatal("Expected deleted=true")
+		}
+	})
+}
+
 func TestTransactionOperations(t *testing.T) {
 	// Create temp directory for WAL
 	tmpDir, err := os.MkdirTemp("", "transaction_ops_test")

@@ -371,6 +371,44 @@ func (tx *Transaction) Duration() time.Duration {
 	return time.Since(tx.StartTime)
 }
 
+// GetFromWriteBuffer checks if a document has been modified in this transaction's
+// write buffer. Returns (document, isDeleted, found).
+// If found is false, the document is not in the buffer — check storage.
+// If found is true and deleted is true, the document was deleted in this transaction.
+// The returned document is a deep copy to prevent callers from corrupting buffer data.
+func (tx *Transaction) GetFromWriteBuffer(collection, docID string) (doc *document.Document, deleted bool, found bool) {
+	tx.mu.RLock()
+	defer tx.mu.RUnlock()
+
+	key := collection + ":" + docID
+	val, exists := tx.writeSet[key]
+	if !exists {
+		return nil, false, false
+	}
+	if val == nil {
+		return nil, true, true // Deleted in this transaction
+	}
+	// Return a deep copy to prevent callers from modifying buffer data
+	docCopy := &document.Document{
+		ID:        val.ID,
+		CreatedAt: val.CreatedAt,
+		UpdatedAt: val.UpdatedAt,
+		Data:      make(map[string]interface{}),
+	}
+	for k, v := range val.Data {
+		docCopy.Data[k] = v
+	}
+	return docCopy, false, true
+}
+
+// ClearWriteBuffer discards the write buffer (used on rollback with deferred writes).
+func (tx *Transaction) ClearWriteBuffer() {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	tx.writeSet = make(map[string]*document.Document)
+	tx.operations = tx.operations[:0]
+}
+
 // Info returns transaction information
 func (tx *Transaction) Info() TxInfo {
 	tx.mu.RLock()

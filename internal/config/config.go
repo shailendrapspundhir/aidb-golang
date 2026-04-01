@@ -59,6 +59,9 @@ type Config struct {
 	TransactionTimeoutSec     int    // Transaction timeout in seconds (default 30)
 	WALSyncPolicy             string // WAL sync policy: "every_write", "on_commit", "async" (default "on_commit")
 	WALMaxSegmentSizeMB       int    // Max WAL segment size in MB (default 100)
+
+	// Recovery configuration
+	SkipRecovery bool // If true, skip WAL recovery on startup (default false)
 }
 
 // Default values
@@ -109,6 +112,7 @@ const (
 	DefaultTransactionTimeoutSec = 30
 	DefaultWALSyncPolicy         = "on_commit"
 	DefaultWALMaxSegmentSizeMB   = 100
+	DefaultSkipRecovery          = false
 )
 
 // Load reads configuration from environment variables
@@ -182,6 +186,7 @@ func Load() *Config {
 	transactionTimeoutSec := getEnvInt("AIDB_TRANSACTION_TIMEOUT_SEC", DefaultTransactionTimeoutSec)
 	walSyncPolicy := getEnv("AIDB_WAL_SYNC_POLICY", DefaultWALSyncPolicy)
 	walMaxSegmentSizeMB := getEnvInt("AIDB_WAL_MAX_SEGMENT_SIZE_MB", DefaultWALMaxSegmentSizeMB)
+	skipRecovery := getEnvBool("AIDB_SKIP_RECOVERY", DefaultSkipRecovery)
 
 	return &Config{
 		DataDir:        dataDir,
@@ -223,6 +228,8 @@ func Load() *Config {
 		TransactionTimeoutSec:     transactionTimeoutSec,
 		WALSyncPolicy:             walSyncPolicy,
 		WALMaxSegmentSizeMB:       walMaxSegmentSizeMB,
+
+		SkipRecovery: skipRecovery,
 	}
 }
 

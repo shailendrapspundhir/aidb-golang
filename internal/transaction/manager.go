@@ -2,11 +2,23 @@ package transaction
 
 import (
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
 	"aidb/internal/wal"
 )
+
+// StorageApplier is implemented by the collection layer to apply pending
+// transaction writes to storage during commit (deferred-write model).
+// Lives in the transaction package as an interface to avoid circular imports.
+type StorageApplier interface {
+	// ApplyOperations applies all operations atomically to storage.
+	// On partial failure, already-applied ops are undone automatically.
+	ApplyOperations(ops []Operation) error
+	// UndoOperations reverses previously applied operations (best effort).
+	UndoOperations(ops []Operation)
+}
 
 // Manager handles transaction lifecycle and auto-transaction mode
 type Manager struct {
@@ -16,6 +28,9 @@ type Manager struct {
 
 	// Configuration
 	config *ManagerConfig
+
+	// StorageApplier flushes deferred writes during commit
+	storageApplier StorageApplier
 }
 
 // ManagerConfig holds transaction manager configuration
@@ -97,16 +112,54 @@ func (m *Manager) Begin(opts ...BeginOption) (*Transaction, error) {
 	return tx, nil
 }
 
-// Commit commits a transaction and removes it from active list
-func (m *Manager) Commit(tx *Transaction) error {
-	_, err := tx.Commit()
+// SetStorageApplier sets the storage applier used to flush deferred writes on commit.
+// Must be called after both Manager and collection.Manager are created.
+func (m *Manager) SetStorageApplier(applier StorageApplier) {
+	m.storageApplier = applier
+}
 
-	// Remove from active regardless of commit success
+// GetWAL returns the WAL instance (used by recovery).
+func (m *Manager) GetWAL() wal.WAL {
+	return m.wal
+}
+
+// Commit commits a transaction: flushes deferred writes to storage, then records
+// COMMIT in the WAL. If the storage flush fails, all applied writes are undone and
+// the transaction is rolled back. If WAL commit fails after a successful flush the
+// applied writes are undone best-effort and an error is returned.
+func (m *Manager) Commit(tx *Transaction) error {
+	ops := tx.GetOperations()
+
+	// Step 1: Flush deferred writes to storage
+	if m.storageApplier != nil && len(ops) > 0 {
+		if err := m.storageApplier.ApplyOperations(ops); err != nil {
+			// Flush failed — rollback (WAL ABORT + discard buffer)
+			if rbErr := m.Rollback(tx); rbErr != nil {
+				log.Printf("rollback after flush failure also failed: %v", rbErr)
+			}
+			return fmt.Errorf("commit failed — storage flush error: %w", err)
+		}
+	}
+
+	// Step 2: Write COMMIT record to WAL and fsync
+	_, err := tx.Commit()
+	if err != nil {
+		// WAL commit failed after storage writes succeeded — undo storage writes
+		if m.storageApplier != nil && len(ops) > 0 {
+			m.storageApplier.UndoOperations(ops)
+		}
+		m.mu.Lock()
+		delete(m.activeTx, tx.ID)
+		m.mu.Unlock()
+		return fmt.Errorf("commit failed — WAL error: %w", err)
+	}
+
+	// Remove from active transactions
 	m.mu.Lock()
 	delete(m.activeTx, tx.ID)
 	m.mu.Unlock()
 
-	return err
+	return nil
 }
 
 // Rollback aborts a transaction and removes it from active list

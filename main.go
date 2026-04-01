@@ -96,6 +96,27 @@ func main() {
 		// Set transaction manager on collection manager
 		collectionManager.SetTransactionManager(txManager)
 
+		// Wire deferred-write StorageApplier so commits flush to storage
+		storageApplier := collection.NewStorageApplier(collectionManager)
+		txManager.SetStorageApplier(storageApplier)
+
+		// --- Crash Recovery ---
+		if !cfg.SkipRecovery {
+			recoveryApplier := collection.NewRecoveryApplier(collectionManager)
+			recoveryMgr := wal.NewRecoveryManager(writeAheadLog, recoveryApplier)
+			recoveryResult, recoveryErr := recoveryMgr.Recover()
+			if recoveryErr != nil {
+				log.Fatalf("WAL recovery failed: %v", recoveryErr)
+			}
+			if recoveryResult.RedoneOps > 0 || recoveryResult.UndoneOps > 0 {
+				log.Printf("Recovery applied: %d ops redone, %d ops undone, %d committed tx, %d in-flight tx aborted",
+					recoveryResult.RedoneOps, recoveryResult.UndoneOps,
+					recoveryResult.CommittedTx, recoveryResult.InFlightTx)
+			}
+		} else {
+			log.Println("WAL recovery skipped (AIDB_SKIP_RECOVERY=true)")
+		}
+
 		// Set transaction manager on API handler (for async transactions)
 		handler.SetTransactionManager(txManager)
 

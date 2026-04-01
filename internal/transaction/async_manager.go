@@ -48,7 +48,10 @@ func (at *AsyncTransaction) AddOperation(op Operation) error {
 		return fmt.Errorf("transaction %s is not active (state: %s)", at.ID, at.State)
 	}
 
-	if at.IsExpired() {
+	// Check expiry inline — do NOT call at.IsExpired() here because we
+	// already hold at.mu.Lock() and IsExpired() tries at.mu.RLock() which
+	// would deadlock (sync.RWMutex is not re-entrant).
+	if time.Now().After(at.ExpiryTime) {
 		at.State = TxStateAborting
 		return fmt.Errorf("transaction %s has expired", at.ID)
 	}
@@ -64,7 +67,9 @@ func (at *AsyncTransaction) AddOperation(op Operation) error {
 	return nil
 }
 
-// Commit commits the async transaction
+// Commit commits the async transaction.
+// Uses the Manager.Commit path so that deferred writes are flushed to storage
+// before the WAL COMMIT record is written.
 func (at *AsyncTransaction) Commit() error {
 	at.mu.Lock()
 	defer at.mu.Unlock()
@@ -73,7 +78,8 @@ func (at *AsyncTransaction) Commit() error {
 		return fmt.Errorf("transaction %s is not active", at.ID)
 	}
 
-	if at.IsExpired() {
+	// Check expiry inline (same deadlock-avoidance reason as AddOperation)
+	if time.Now().After(at.ExpiryTime) {
 		at.State = TxStateAborting
 		if at.tx != nil {
 			at.manager.Rollback(at.tx)
@@ -82,8 +88,8 @@ func (at *AsyncTransaction) Commit() error {
 	}
 
 	if at.tx != nil {
-		_, err := at.tx.Commit()
-		if err != nil {
+		// Use manager.Commit to flush deferred writes + WAL commit
+		if err := at.manager.Commit(at.tx); err != nil {
 			at.State = TxStateAborted
 			return err
 		}
