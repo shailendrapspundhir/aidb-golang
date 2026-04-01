@@ -7,6 +7,7 @@ import (
 	"aidb/internal/fulltext"
 	"aidb/internal/rbac"
 	"aidb/internal/storage"
+	"aidb/internal/transaction"
 	"encoding/json"
 	"errors"
 	"io"
@@ -17,9 +18,11 @@ import (
 
 // Handler holds the API handlers and dependencies
 type Handler struct {
-	collectionManager *collection.Manager
-	authService       *auth.Service
-	enforcer          *rbac.Enforcer
+	collectionManager  *collection.Manager
+	authService        *auth.Service
+	enforcer           *rbac.Enforcer
+	transactionManager *transaction.Manager
+	asyncTxManager     *transaction.AsyncManager
 }
 
 // NewHandler creates a new API handler
@@ -29,6 +32,12 @@ func NewHandler(cm *collection.Manager, authService *auth.Service, enforcer *rba
 		authService:       authService,
 		enforcer:          enforcer,
 	}
+}
+
+// SetTransactionManager sets the transaction manager and creates async manager
+func (h *Handler) SetTransactionManager(tm *transaction.Manager) {
+	h.transactionManager = tm
+	h.asyncTxManager = transaction.NewAsyncManager(tm, 5*time.Minute)
 }
 
 // RegisterRoutes registers all API routes
@@ -63,6 +72,11 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("PUT /api/v1/collections/{name}/documents/{id}", protected(h.UpdateDocument))
 	mux.Handle("PATCH /api/v1/collections/{name}/documents/{id}", protected(h.PatchDocument))
 	mux.Handle("DELETE /api/v1/collections/{name}/documents/{id}", protected(h.DeleteDocument))
+
+	// Bulk operation routes
+	mux.Handle("POST /api/v1/collections/{name}/bulk/insert", protected(h.BulkInsert))
+	mux.Handle("POST /api/v1/collections/{name}/bulk/update", protected(h.BulkUpdate))
+	mux.Handle("POST /api/v1/collections/{name}/bulk/delete", protected(h.BulkDelete))
 
 	// Schema routes
 	mux.Handle("GET /api/v1/collections/{name}/schema", protected(h.GetSchema))
@@ -106,6 +120,16 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("POST /api/v1/environments", protected(h.CreateEnvironment))
 	mux.Handle("GET /api/v1/environments", protected(h.ListEnvironments))
 	mux.Handle("DELETE /api/v1/environments/{id}", protected(h.DeleteEnvironment))
+
+	// Async Transaction Routes
+	mux.Handle("POST /api/v1/transactions/begin", protected(h.BeginTransaction))
+	mux.Handle("POST /api/v1/transactions/{id}/commit", protected(h.CommitTransaction))
+	mux.Handle("POST /api/v1/transactions/{id}/rollback", protected(h.RollbackTransaction))
+	mux.Handle("GET /api/v1/transactions/{id}/status", protected(h.GetTransactionStatus))
+	mux.Handle("GET /api/v1/transactions", protected(h.ListActiveTransactions))
+
+	// Batch Execution Route
+	mux.Handle("POST /api/v1/batch", protected(h.ExecuteBatch))
 }
 
 // Auth Handlers
@@ -427,7 +451,41 @@ func (h *Handler) InsertDocument(w http.ResponseWriter, r *http.Request) {
 		doc = document.NewDocument(req.Data)
 	}
 
-	if err := col.Insert(doc); err != nil {
+	// Check for async transaction ID in header
+	txID := r.Header.Get("X-Transaction-ID")
+	if txID != "" && h.asyncTxManager != nil {
+		// Use async transaction
+		asyncTx, err := h.asyncTxManager.GetTransaction(txID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		// Create operation for the transaction
+		op := transaction.Operation{
+			Type:       transaction.OpInsert,
+			Collection: collectionName,
+			DocumentID: doc.ID,
+			NewValue:   doc,
+		}
+
+		if err := asyncTx.AddOperation(op); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		// Return pending response
+		writeSuccessWithStatus(w, http.StatusAccepted, map[string]interface{}{
+			"message":       "Operation queued in transaction",
+			"transactionId": txID,
+			"status":        "pending",
+			"document":      doc,
+		})
+		return
+	}
+
+	// Use transactional insert for ACID compliance
+	if err := col.InsertWithAutoTx(doc); err != nil {
 		var validationErr *document.ValidationError
 		if errors.As(err, &validationErr) {
 			writeError(w, http.StatusBadRequest, "validation error: "+err.Error())
@@ -558,7 +616,8 @@ func (h *Handler) UpdateDocument(w http.ResponseWriter, r *http.Request) {
 	// Update the document data
 	existingDoc.Update(req.Data)
 
-	if err := col.Update(existingDoc); err != nil {
+	// Use transactional update for ACID compliance
+	if err := col.UpdateWithAutoTx(existingDoc); err != nil {
 		var validationErr *document.ValidationError
 		if errors.As(err, &validationErr) {
 			writeError(w, http.StatusBadRequest, "validation error: "+err.Error())
@@ -617,7 +676,8 @@ func (h *Handler) PatchDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	doc, err := col.Patch(docID, req.Data)
+	// Use transactional patch for ACID compliance
+	doc, err := col.PatchWithAutoTx(docID, req.Data)
 	if err != nil {
 		if errors.Is(err, storage.ErrDocumentNotFound) {
 			writeError(w, http.StatusNotFound, "document not found")
@@ -646,7 +706,8 @@ func (h *Handler) DeleteDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := col.Delete(docID); err != nil {
+	// Use transactional delete for ACID compliance
+	if err := col.DeleteWithAutoTx(docID); err != nil {
 		if errors.Is(err, storage.ErrDocumentNotFound) {
 			writeError(w, http.StatusNotFound, "document not found")
 			return
@@ -1353,5 +1414,502 @@ func (h *Handler) RebuildFullTextIndex(w http.ResponseWriter, r *http.Request) {
 		"collection": collectionName,
 		"fields":     fields,
 		"docCount":   col.GetFullTextIndex().TotalDocs(),
+	})
+}
+
+// BulkInsertRequest represents a bulk insert request
+type BulkInsertRequest struct {
+	Documents []map[string]interface{} `json:"documents"`
+}
+
+// BulkInsertResponse represents a bulk insert response
+type BulkInsertResponse struct {
+	InsertedIDs []string `json:"insertedIds"`
+	Count       int      `json:"count"`
+}
+
+// BulkInsert inserts multiple documents in a single transaction
+func (h *Handler) BulkInsert(w http.ResponseWriter, r *http.Request) {
+	collectionName := r.PathValue("name")
+
+	col, err := h.collectionManager.GetCollection(collectionName)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	var req BulkInsertRequest
+	if err := parseJSONBody(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+
+	if len(req.Documents) == 0 {
+		writeError(w, http.StatusBadRequest, "documents array is required and cannot be empty")
+		return
+	}
+
+	// Convert request data to documents
+	docs := make([]*document.Document, 0, len(req.Documents))
+	for _, data := range req.Documents {
+		var doc *document.Document
+		if id, ok := data["_id"].(string); ok && id != "" {
+			doc = document.NewDocumentWithID(id, data)
+		} else {
+			doc = document.NewDocument(data)
+		}
+		docs = append(docs, doc)
+	}
+
+	// Perform bulk insert with transaction
+	result, err := col.BulkInsert(docs)
+	if err != nil {
+		var validationErr *document.ValidationError
+		if errors.As(err, &validationErr) {
+			writeError(w, http.StatusBadRequest, "validation error: "+err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "bulk insert failed: "+err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, Response{
+		Success: true,
+		Data: BulkInsertResponse{
+			InsertedIDs: result.InsertedIDs,
+			Count:       result.Count,
+		},
+	})
+}
+
+// BulkUpdateRequest represents a bulk update request
+type BulkUpdateRequest struct {
+	Updates []collection.BulkUpdateRequest `json:"updates"`
+}
+
+// BulkUpdateResponse represents a bulk update response
+type BulkUpdateResponse struct {
+	UpdatedIDs []string `json:"updatedIds"`
+	Count      int      `json:"count"`
+}
+
+// BulkUpdate updates multiple documents in a single transaction
+func (h *Handler) BulkUpdate(w http.ResponseWriter, r *http.Request) {
+	collectionName := r.PathValue("name")
+
+	col, err := h.collectionManager.GetCollection(collectionName)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	var req BulkUpdateRequest
+	if err := parseJSONBody(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+
+	if len(req.Updates) == 0 {
+		writeError(w, http.StatusBadRequest, "updates array is required and cannot be empty")
+		return
+	}
+
+	// Convert to pointer slice
+	updates := make([]*collection.BulkUpdateRequest, len(req.Updates))
+	for i := range req.Updates {
+		updates[i] = &req.Updates[i]
+	}
+
+	// Perform bulk update with transaction
+	result, err := col.BulkUpdate(updates)
+	if err != nil {
+		var validationErr *document.ValidationError
+		if errors.As(err, &validationErr) {
+			writeError(w, http.StatusBadRequest, "validation error: "+err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "bulk update failed: "+err.Error())
+		return
+	}
+
+	writeSuccess(w, BulkUpdateResponse{
+		UpdatedIDs: result.UpdatedIDs,
+		Count:      result.Count,
+	})
+}
+
+// BulkDeleteRequest represents a bulk delete request
+type BulkDeleteRequest struct {
+	IDs []string `json:"ids"`
+}
+
+// BulkDeleteResponse represents a bulk delete response
+type BulkDeleteResponse struct {
+	DeletedIDs []string `json:"deletedIds"`
+	Count      int      `json:"count"`
+}
+
+// BulkDelete deletes multiple documents in a single transaction
+func (h *Handler) BulkDelete(w http.ResponseWriter, r *http.Request) {
+	collectionName := r.PathValue("name")
+
+	col, err := h.collectionManager.GetCollection(collectionName)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	var req BulkDeleteRequest
+	if err := parseJSONBody(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return
+	}
+
+	if len(req.IDs) == 0 {
+		writeError(w, http.StatusBadRequest, "ids array is required and cannot be empty")
+		return
+	}
+
+	// Perform bulk delete with transaction
+	result, err := col.BulkDelete(req.IDs)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "bulk delete failed: "+err.Error())
+		return
+	}
+
+	writeSuccess(w, BulkDeleteResponse{
+		DeletedIDs: result.DeletedIDs,
+		Count:      result.Count,
+	})
+}
+
+// ==================== ASYNC TRANSACTION HANDLERS ====================
+
+// BeginTransactionRequest represents a request to start an async transaction
+type BeginTransactionRequest struct {
+	TimeoutSeconds int `json:"timeoutSeconds,omitempty"`
+}
+
+// BeginTransaction handles POST /api/v1/transactions/begin
+func (h *Handler) BeginTransaction(w http.ResponseWriter, r *http.Request) {
+	if h.asyncTxManager == nil {
+		writeError(w, http.StatusServiceUnavailable, "Transaction support not enabled")
+		return
+	}
+
+	var req BeginTransactionRequest
+	if err := parseJSONBody(r, &req); err != nil {
+		// Use default timeout if no body
+		req.TimeoutSeconds = 300 // 5 minutes default
+	}
+
+	timeout := time.Duration(req.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 5 * time.Minute
+	}
+
+	asyncTx, err := h.asyncTxManager.StartTransaction(timeout)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeSuccessWithStatus(w, http.StatusCreated, map[string]interface{}{
+		"transactionId": asyncTx.ID,
+		"status":        "active",
+		"expiresAt":     asyncTx.ExpiryTime.Format(time.RFC3339),
+		"timeout":       timeout.Seconds(),
+	})
+}
+
+// CommitTransaction handles POST /api/v1/transactions/{id}/commit
+func (h *Handler) CommitTransaction(w http.ResponseWriter, r *http.Request) {
+	if h.asyncTxManager == nil {
+		writeError(w, http.StatusServiceUnavailable, "Transaction support not enabled")
+		return
+	}
+
+	txID := r.PathValue("id")
+	if txID == "" {
+		writeError(w, http.StatusBadRequest, "transaction id is required")
+		return
+	}
+
+	if err := h.asyncTxManager.CommitTransaction(txID); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeSuccess(w, map[string]string{
+		"message":       "Transaction committed successfully",
+		"transactionId": txID,
+		"status":        "committed",
+	})
+}
+
+// RollbackTransaction handles POST /api/v1/transactions/{id}/rollback
+func (h *Handler) RollbackTransaction(w http.ResponseWriter, r *http.Request) {
+	if h.asyncTxManager == nil {
+		writeError(w, http.StatusServiceUnavailable, "Transaction support not enabled")
+		return
+	}
+
+	txID := r.PathValue("id")
+	if txID == "" {
+		writeError(w, http.StatusBadRequest, "transaction id is required")
+		return
+	}
+
+	if err := h.asyncTxManager.RollbackTransaction(txID); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	writeSuccess(w, map[string]string{
+		"message":       "Transaction rolled back successfully",
+		"transactionId": txID,
+		"status":        "aborted",
+	})
+}
+
+// GetTransactionStatus handles GET /api/v1/transactions/{id}/status
+func (h *Handler) GetTransactionStatus(w http.ResponseWriter, r *http.Request) {
+	if h.asyncTxManager == nil {
+		writeError(w, http.StatusServiceUnavailable, "Transaction support not enabled")
+		return
+	}
+
+	txID := r.PathValue("id")
+	if txID == "" {
+		writeError(w, http.StatusBadRequest, "transaction id is required")
+		return
+	}
+
+	asyncTx, err := h.asyncTxManager.GetTransaction(txID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	info := asyncTx.Info()
+	writeSuccess(w, map[string]interface{}{
+		"transactionId":  info.ID,
+		"status":         info.State,
+		"operationCount": info.OpCount,
+		"expiresAt":      asyncTx.ExpiryTime.Format(time.RFC3339),
+		"remainingTime":  asyncTx.RemainingTime().Seconds(),
+	})
+}
+
+// ListActiveTransactions handles GET /api/v1/transactions
+func (h *Handler) ListActiveTransactions(w http.ResponseWriter, r *http.Request) {
+	if h.asyncTxManager == nil {
+		writeError(w, http.StatusServiceUnavailable, "Transaction support not enabled")
+		return
+	}
+
+	active := h.asyncTxManager.GetActiveTransactions()
+
+	txs := make([]map[string]interface{}, 0, len(active))
+	for _, tx := range active {
+		info := tx.Info()
+		txs = append(txs, map[string]interface{}{
+			"transactionId":  info.ID,
+			"status":         info.State,
+			"operationCount": info.OpCount,
+			"expiresAt":      tx.ExpiryTime.Format(time.RFC3339),
+			"remainingTime":  tx.RemainingTime().Seconds(),
+		})
+	}
+
+	writeSuccess(w, map[string]interface{}{
+		"transactions": txs,
+		"count":        len(txs),
+	})
+}
+
+// ==================== BATCH EXECUTION HANDLERS ====================
+
+// BatchRequestItem represents a single request in a batch
+type BatchRequestItem struct {
+	ID              string                 `json:"id,omitempty"`
+	Method          string                 `json:"method"`
+	Path            string                 `json:"path"`
+	Headers         map[string]string      `json:"headers,omitempty"`
+	Body            map[string]interface{} `json:"body,omitempty"`
+}
+
+// BatchRequest represents a batch of requests to execute
+type BatchRequest struct {
+	Requests        []BatchRequestItem `json:"requests"`
+	ContinueOnError bool               `json:"continueOnError,omitempty"`
+}
+
+// BatchResponseItem represents a single response in a batch
+type BatchResponseItem struct {
+	ID     string                 `json:"id,omitempty"`
+	Status int                    `json:"status"`
+	Body   map[string]interface{} `json:"body,omitempty"`
+	Error  string                 `json:"error,omitempty"`
+}
+
+// ExecuteBatch handles POST /api/v1/batch
+func (h *Handler) ExecuteBatch(w http.ResponseWriter, r *http.Request) {
+	var req BatchRequest
+	if err := parseJSONBody(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid JSON: "+err.Error())
+		return
+	}
+
+	if len(req.Requests) == 0 {
+		writeError(w, http.StatusBadRequest, "No requests provided")
+		return
+	}
+
+	responses := make([]BatchResponseItem, 0, len(req.Requests))
+
+	for _, item := range req.Requests {
+		response := h.executeBatchItem(r, item)
+		responses = append(responses, response)
+
+		// Stop on error if not continuing on error
+		if !req.ContinueOnError && response.Status >= 400 {
+			break
+		}
+	}
+
+	writeSuccess(w, map[string]interface{}{
+		"responses": responses,
+		"count":     len(responses),
+	})
+}
+
+// executeBatchItem executes a single batch request item
+func (h *Handler) executeBatchItem(r *http.Request, item BatchRequestItem) BatchResponseItem {
+	response := BatchResponseItem{
+		ID:     item.ID,
+		Status: http.StatusOK,
+		Body:   make(map[string]interface{}),
+	}
+
+	// Parse the path to determine the operation
+	parts := strings.Split(strings.Trim(item.Path, "/"), "/")
+
+	// Handle different API paths
+	switch {
+	// POST /api/v1/collections/{name}/documents
+	case len(parts) >= 5 && parts[0] == "api" && parts[1] == "v1" && parts[2] == "collections" && len(parts) >= 5 && parts[4] == "documents":
+		if item.Method == "POST" {
+			colName := parts[3]
+			col, err := h.collectionManager.GetCollection(colName)
+			if err != nil {
+				response.Status = http.StatusNotFound
+				response.Error = "Collection not found"
+				return response
+			}
+
+			data, ok := item.Body["data"].(map[string]interface{})
+			if !ok {
+				response.Status = http.StatusBadRequest
+				response.Error = "Missing data field"
+				return response
+			}
+
+			var doc *document.Document
+			if id, ok := item.Body["_id"].(string); ok && id != "" {
+				doc = document.NewDocumentWithID(id, data)
+			} else {
+				doc = document.NewDocument(data)
+			}
+
+			if err := col.InsertWithAutoTx(doc); err != nil {
+				response.Status = http.StatusBadRequest
+				response.Error = err.Error()
+				return response
+			}
+
+			response.Body["document"] = doc
+			response.Status = http.StatusCreated
+		}
+
+	// PUT /api/v1/collections/{name}/documents/{id}
+	case len(parts) >= 6 && parts[0] == "api" && parts[1] == "v1" && parts[2] == "collections":
+		if item.Method == "PUT" || item.Method == "PATCH" {
+			colName := parts[3]
+			docID := parts[5]
+
+			col, err := h.collectionManager.GetCollection(colName)
+			if err != nil {
+				response.Status = http.StatusNotFound
+				response.Error = "Collection not found"
+				return response
+			}
+
+			data, ok := item.Body["data"].(map[string]interface{})
+			if !ok {
+				response.Status = http.StatusBadRequest
+				response.Error = "Missing data field"
+				return response
+			}
+
+			var updateErr error
+			var updatedDoc *document.Document
+			if item.Method == "PUT" {
+				// For PUT, get existing doc first to preserve createdAt
+				oldDoc, _ := col.Get(docID)
+				newDoc := document.NewDocumentWithID(docID, data)
+				if oldDoc != nil {
+					newDoc.CreatedAt = oldDoc.CreatedAt
+				}
+				updateErr = col.UpdateWithAutoTx(newDoc)
+				updatedDoc = newDoc
+			} else {
+				updatedDoc, updateErr = col.PatchWithAutoTx(docID, data)
+			}
+
+			if updateErr != nil {
+				response.Status = http.StatusBadRequest
+				response.Error = updateErr.Error()
+				return response
+			}
+
+			response.Body["document"] = updatedDoc
+		}
+
+	// DELETE /api/v1/collections/{name}/documents/{id}
+	case len(parts) >= 6 && parts[0] == "api" && parts[1] == "v1" && parts[2] == "collections" && item.Method == "DELETE":
+		colName := parts[3]
+		docID := parts[5]
+
+		col, err := h.collectionManager.GetCollection(colName)
+		if err != nil {
+			response.Status = http.StatusNotFound
+			response.Error = "Collection not found"
+			return response
+		}
+
+		if err := col.DeleteWithAutoTx(docID); err != nil {
+			response.Status = http.StatusBadRequest
+			response.Error = err.Error()
+			return response
+		}
+
+		response.Body["message"] = "Document deleted"
+
+	default:
+		response.Status = http.StatusBadRequest
+		response.Error = "Unsupported batch operation"
+	}
+
+	return response
+}
+
+// writeSuccessWithStatus writes a success response with a specific status code
+func writeSuccessWithStatus(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"data":    data,
 	})
 }

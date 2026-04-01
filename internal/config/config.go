@@ -52,6 +52,13 @@ type Config struct {
 	// Hash Partitioning configuration
 	PartitionCount     int   // Number of partitions (default 16)
 	PartitionMaxMemMB  int64 // Max memory per partition (default 50MB)
+
+	// Transaction configuration
+	TransactionsEnabled       bool   // Enable/disable transaction support
+	TransactionAutoCommit     bool   // Auto-commit single operations (default true)
+	TransactionTimeoutSec     int    // Transaction timeout in seconds (default 30)
+	WALSyncPolicy             string // WAL sync policy: "every_write", "on_commit", "async" (default "on_commit")
+	WALMaxSegmentSizeMB       int    // Max WAL segment size in MB (default 100)
 }
 
 // Default values
@@ -95,6 +102,13 @@ const (
 	// Hash Partitioning defaults
 	DefaultPartitionCount    = 16
 	DefaultPartitionMaxMemMB = 50
+
+	// Transaction defaults
+	DefaultTransactionsEnabled   = true
+	DefaultTransactionAutoCommit = true
+	DefaultTransactionTimeoutSec = 30
+	DefaultWALSyncPolicy         = "on_commit"
+	DefaultWALMaxSegmentSizeMB   = 100
 )
 
 // Load reads configuration from environment variables
@@ -162,6 +176,13 @@ func Load() *Config {
 	partitionCount := getEnvInt("AIDB_PARTITION_COUNT", DefaultPartitionCount)
 	partitionMaxMemMB := getEnvInt64("AIDB_PARTITION_MAX_MEM_MB", DefaultPartitionMaxMemMB)
 
+	// Transaction configuration
+	transactionsEnabled := getEnvBool("AIDB_TRANSACTIONS_ENABLED", DefaultTransactionsEnabled)
+	transactionAutoCommit := getEnvBool("AIDB_TRANSACTION_AUTO_COMMIT", DefaultTransactionAutoCommit)
+	transactionTimeoutSec := getEnvInt("AIDB_TRANSACTION_TIMEOUT_SEC", DefaultTransactionTimeoutSec)
+	walSyncPolicy := getEnv("AIDB_WAL_SYNC_POLICY", DefaultWALSyncPolicy)
+	walMaxSegmentSizeMB := getEnvInt("AIDB_WAL_MAX_SEGMENT_SIZE_MB", DefaultWALMaxSegmentSizeMB)
+
 	return &Config{
 		DataDir:        dataDir,
 		DatabaseFile:   databaseFile,
@@ -196,6 +217,12 @@ func Load() *Config {
 
 		PartitionCount:   partitionCount,
 		PartitionMaxMemMB: partitionMaxMemMB,
+
+		TransactionsEnabled:       transactionsEnabled,
+		TransactionAutoCommit:     transactionAutoCommit,
+		TransactionTimeoutSec:     transactionTimeoutSec,
+		WALSyncPolicy:             walSyncPolicy,
+		WALMaxSegmentSizeMB:       walMaxSegmentSizeMB,
 	}
 }
 

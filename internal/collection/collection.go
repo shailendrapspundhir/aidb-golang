@@ -5,6 +5,7 @@ import (
 	"aidb/internal/document"
 	"aidb/internal/fulltext"
 	"aidb/internal/storage"
+	"aidb/internal/transaction"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +27,9 @@ type Collection struct {
 	// Full-text search
 	fulltextIndex  *fulltext.InvertedIndex
 	fulltextFields []string // fields to index for full-text search
+
+	// Transaction support
+	txManager *transaction.Manager
 }
 
 // NewCollection creates a new collection with memory storage
@@ -494,6 +498,7 @@ type Manager struct {
 	mu          sync.RWMutex
 	db          *bolt.DB
 	config      *config.Config
+	txManager   *transaction.Manager
 }
 
 // NewManager creates a new collection manager without persistence
@@ -697,6 +702,11 @@ func (m *Manager) CreateCollection(name string, schema *document.Schema) (*Colle
 	// Set manager reference for $lookup support
 	col.manager = m
 
+	// Set transaction manager if available
+	if m.txManager != nil {
+		col.SetTransactionManager(m.txManager)
+	}
+
 	m.collections[name] = col
 
 	// Save metadata
@@ -802,7 +812,7 @@ func (m *Manager) Close() error {
 			hs.Close()
 		}
 	}
-	
+
 	if m.db != nil {
 		return m.db.Close()
 	}
@@ -812,6 +822,26 @@ func (m *Manager) Close() error {
 // GetDB returns the underlying BoltDB instance
 func (m *Manager) GetDB() *bolt.DB {
 	return m.db
+}
+
+// SetTransactionManager sets the transaction manager for all collections
+func (m *Manager) SetTransactionManager(tm *transaction.Manager) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.txManager = tm
+
+	// Set transaction manager on all existing collections
+	for _, col := range m.collections {
+		col.SetTransactionManager(tm)
+	}
+}
+
+// GetTransactionManager returns the transaction manager
+func (m *Manager) GetTransactionManager() *transaction.Manager {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.txManager
 }
 
 // ExportData represents the export format for a collection
@@ -924,4 +954,755 @@ func (m *Manager) ImportRawDocuments(name string, docs []*document.Document, ove
 		Documents: docs,
 	}
 	return m.ImportCollection(exportData, overwrite)
+}
+
+// SetTransactionManager sets the transaction manager for this collection
+func (c *Collection) SetTransactionManager(tm *transaction.Manager) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.txManager = tm
+}
+
+// GetTransactionManager returns the transaction manager for this collection
+func (c *Collection) GetTransactionManager() *transaction.Manager {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.txManager
+}
+
+// InsertTx inserts a document within an existing transaction
+func (c *Collection) InsertTx(tx *transaction.Transaction, doc *document.Document) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !tx.IsActive() {
+		return fmt.Errorf("transaction is not active")
+	}
+
+	// Validate against schema if one exists
+	if c.Schema != nil {
+		if err := c.Schema.Validate(doc); err != nil {
+			return err
+		}
+	}
+
+	// Create operation for WAL
+	op := transaction.Operation{
+		Type:       transaction.OpInsert,
+		Collection: c.Name,
+		DocumentID: doc.ID,
+		OldValue:   nil,
+		NewValue:   doc,
+	}
+
+	// Record operation in transaction
+	if err := tx.AddOperation(op); err != nil {
+		return fmt.Errorf("failed to record operation: %w", err)
+	}
+
+	// Insert into storage
+	if err := c.storage.Insert(doc); err != nil {
+		return err
+	}
+
+	// Update indexes
+	for field, idx := range c.indexes {
+		if value, exists := doc.Data[field]; exists {
+			idx.Insert(value, doc.ID)
+		}
+	}
+
+	// Update full-text index
+	c.indexDocForFullTextLocked(doc)
+
+	return nil
+}
+
+// UpdateTx updates a document within an existing transaction
+func (c *Collection) UpdateTx(tx *transaction.Transaction, doc *document.Document) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !tx.IsActive() {
+		return fmt.Errorf("transaction is not active")
+	}
+
+	// Get old document for index updates and rollback
+	oldDoc, err := c.storage.Get(doc.ID)
+	if err != nil {
+		return err
+	}
+
+	// Validate against schema if one exists
+	if c.Schema != nil {
+		if err := c.Schema.Validate(doc); err != nil {
+			return err
+		}
+	}
+
+	// Create operation for WAL
+	op := transaction.Operation{
+		Type:       transaction.OpUpdate,
+		Collection: c.Name,
+		DocumentID: doc.ID,
+		OldValue:   oldDoc,
+		NewValue:   doc,
+	}
+
+	// Record operation in transaction
+	if err := tx.AddOperation(op); err != nil {
+		return fmt.Errorf("failed to record operation: %w", err)
+	}
+
+	// Update storage
+	if err := c.storage.Update(doc); err != nil {
+		return err
+	}
+
+	// Update indexes
+	for field, idx := range c.indexes {
+		// Remove old value
+		if oldValue, exists := oldDoc.Data[field]; exists {
+			idx.Delete(oldValue, doc.ID)
+		}
+		// Add new value
+		if newValue, exists := doc.Data[field]; exists {
+			idx.Insert(newValue, doc.ID)
+		}
+	}
+
+	// Update full-text index (reindex the document)
+	if c.fulltextIndex != nil {
+		c.indexDocForFullTextLocked(doc)
+	}
+
+	return nil
+}
+
+// DeleteTx deletes a document within an existing transaction
+func (c *Collection) DeleteTx(tx *transaction.Transaction, id string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if !tx.IsActive() {
+		return fmt.Errorf("transaction is not active")
+	}
+
+	// Get document for index updates and rollback
+	doc, err := c.storage.Get(id)
+	if err != nil {
+		return err
+	}
+
+	// Create operation for WAL
+	op := transaction.Operation{
+		Type:       transaction.OpDelete,
+		Collection: c.Name,
+		DocumentID: id,
+		OldValue:   doc,
+		NewValue:   nil,
+	}
+
+	// Record operation in transaction
+	if err := tx.AddOperation(op); err != nil {
+		return fmt.Errorf("failed to record operation: %w", err)
+	}
+
+	// Delete from storage
+	if err := c.storage.Delete(id); err != nil {
+		return err
+	}
+
+	// Remove from indexes
+	for field, idx := range c.indexes {
+		if value, exists := doc.Data[field]; exists {
+			idx.Delete(value, id)
+		}
+	}
+
+	// Remove from full-text index
+	if c.fulltextIndex != nil {
+		c.fulltextIndex.RemoveDocument(id)
+	}
+
+	return nil
+}
+
+// InsertWithAutoTx inserts a document with automatic transaction wrapping
+// If the operation fails, all changes are rolled back (ACID compliant)
+func (c *Collection) InsertWithAutoTx(doc *document.Document) error {
+	if c.txManager == nil {
+		// Fallback to non-transactional insert
+		return c.Insert(doc)
+	}
+
+	return c.txManager.AutoTransaction(func(tx *transaction.Transaction) error {
+		return c.InsertTx(tx, doc)
+	})
+}
+
+// UpdateWithAutoTx updates a document with automatic transaction wrapping
+// If the operation fails, all changes are rolled back (ACID compliant)
+func (c *Collection) UpdateWithAutoTx(doc *document.Document) error {
+	if c.txManager == nil {
+		// Fallback to non-transactional update
+		return c.Update(doc)
+	}
+
+	return c.txManager.AutoTransaction(func(tx *transaction.Transaction) error {
+		return c.UpdateTx(tx, doc)
+	})
+}
+
+// DeleteWithAutoTx deletes a document with automatic transaction wrapping
+// If the operation fails, all changes are rolled back (ACID compliant)
+func (c *Collection) DeleteWithAutoTx(id string) error {
+	if c.txManager == nil {
+		// Fallback to non-transactional delete
+		return c.Delete(id)
+	}
+
+	return c.txManager.AutoTransaction(func(tx *transaction.Transaction) error {
+		return c.DeleteTx(tx, id)
+	})
+}
+
+// PatchWithAutoTx patches a document with automatic transaction wrapping
+// If the operation fails, all changes are rolled back (ACID compliant)
+func (c *Collection) PatchWithAutoTx(id string, data map[string]interface{}) (*document.Document, error) {
+	if c.txManager == nil {
+		// Fallback to non-transactional patch
+		return c.Patch(id, data)
+	}
+
+	var result *document.Document
+	err := c.txManager.AutoTransaction(func(tx *transaction.Transaction) error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		if !tx.IsActive() {
+			return fmt.Errorf("transaction is not active")
+		}
+
+		// Get existing document
+		doc, err := c.storage.Get(id)
+		if err != nil {
+			return err
+		}
+
+		// Store old values for index updates
+		oldData := make(map[string]interface{})
+		for field := range c.indexes {
+			if value, exists := doc.Data[field]; exists {
+				oldData[field] = value
+			}
+		}
+
+		// Create a copy for old value
+		oldDocCopy := &document.Document{
+			ID:        doc.ID,
+			CreatedAt: doc.CreatedAt,
+			UpdatedAt: doc.UpdatedAt,
+			Data:      make(map[string]interface{}),
+		}
+		for k, v := range doc.Data {
+			oldDocCopy.Data[k] = v
+		}
+
+		// Merge the data
+		doc.MergeData(data)
+
+		// Validate against schema if one exists
+		if c.Schema != nil {
+			if err := c.Schema.Validate(doc); err != nil {
+				return err
+			}
+		}
+
+		// Create operation for WAL
+		op := transaction.Operation{
+			Type:       transaction.OpUpdate,
+			Collection: c.Name,
+			DocumentID: doc.ID,
+			OldValue:   oldDocCopy,
+			NewValue:   doc,
+		}
+
+		// Record operation in transaction
+		if err := tx.AddOperation(op); err != nil {
+			return fmt.Errorf("failed to record operation: %w", err)
+		}
+
+		// Update the document
+		if err := c.storage.Update(doc); err != nil {
+			return err
+		}
+
+		// Update indexes
+		for field, idx := range c.indexes {
+			// Remove old value
+			if oldValue, exists := oldData[field]; exists {
+				idx.Delete(oldValue, doc.ID)
+			}
+			// Add new value
+			if newValue, exists := doc.Data[field]; exists {
+				idx.Insert(newValue, doc.ID)
+			}
+		}
+
+		result = doc
+		return nil
+	})
+
+	return result, err
+}
+
+// BulkInsertResult represents the result of a bulk insert operation
+type BulkInsertResult struct {
+	InsertedIDs []string `json:"insertedIds"`
+	Count       int      `json:"count"`
+	Errors      []error  `json:"errors,omitempty"`
+}
+
+// BulkInsert inserts multiple documents in a single transaction
+// If any document fails validation, the entire operation is rolled back
+func (c *Collection) BulkInsert(docs []*document.Document) (*BulkInsertResult, error) {
+	if c.txManager == nil {
+		// Fallback to non-transactional bulk insert
+		return c.bulkInsertNonTransactional(docs)
+	}
+
+	var result *BulkInsertResult
+	err := c.txManager.AutoTransaction(func(tx *transaction.Transaction) error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		if !tx.IsActive() {
+			return fmt.Errorf("transaction is not active")
+		}
+
+		result = &BulkInsertResult{
+			InsertedIDs: make([]string, 0, len(docs)),
+			Errors:      make([]error, 0),
+		}
+
+		// Validate all documents first
+		for i, doc := range docs {
+			if c.Schema != nil {
+				if err := c.Schema.Validate(doc); err != nil {
+					return fmt.Errorf("document %d validation failed: %w", i, err)
+				}
+			}
+		}
+
+		// Insert all documents
+		for i, doc := range docs {
+			// Create operation for WAL
+			op := transaction.Operation{
+				Type:       transaction.OpInsert,
+				Collection: c.Name,
+				DocumentID: doc.ID,
+				OldValue:   nil,
+				NewValue:   doc,
+			}
+
+			// Record operation in transaction
+			if err := tx.AddOperation(op); err != nil {
+				return fmt.Errorf("failed to record operation for doc %d: %w", i, err)
+			}
+
+			// Insert into storage
+			if err := c.storage.Insert(doc); err != nil {
+				return fmt.Errorf("failed to insert document %d: %w", i, err)
+			}
+
+			// Update indexes
+			for field, idx := range c.indexes {
+				if value, exists := doc.Data[field]; exists {
+					idx.Insert(value, doc.ID)
+				}
+			}
+
+			// Update full-text index
+			c.indexDocForFullTextLocked(doc)
+
+			result.InsertedIDs = append(result.InsertedIDs, doc.ID)
+			result.Count++
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// bulkInsertNonTransactional performs bulk insert without transactions
+func (c *Collection) bulkInsertNonTransactional(docs []*document.Document) (*BulkInsertResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	result := &BulkInsertResult{
+		InsertedIDs: make([]string, 0, len(docs)),
+		Errors:      make([]error, 0),
+	}
+
+	for i, doc := range docs {
+		if c.Schema != nil {
+			if err := c.Schema.Validate(doc); err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("document %d: %w", i, err))
+				continue
+			}
+		}
+
+		if err := c.storage.Insert(doc); err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("document %d: %w", i, err))
+			continue
+		}
+
+		// Update indexes
+		for field, idx := range c.indexes {
+			if value, exists := doc.Data[field]; exists {
+				idx.Insert(value, doc.ID)
+			}
+		}
+
+		c.indexDocForFullTextLocked(doc)
+		result.InsertedIDs = append(result.InsertedIDs, doc.ID)
+		result.Count++
+	}
+
+	return result, nil
+}
+
+// BulkUpdateResult represents the result of a bulk update operation
+type BulkUpdateResult struct {
+	UpdatedIDs []string `json:"updatedIds"`
+	Count      int      `json:"count"`
+	Errors     []error  `json:"errors,omitempty"`
+}
+
+// BulkUpdateRequest represents a single document update in a bulk operation
+type BulkUpdateRequest struct {
+	ID   string                 `json:"_id"`
+	Data map[string]interface{} `json:"data"`
+}
+
+// BulkUpdate updates multiple documents in a single transaction
+// If any update fails, the entire operation is rolled back
+func (c *Collection) BulkUpdate(updates []*BulkUpdateRequest) (*BulkUpdateResult, error) {
+	if c.txManager == nil {
+		// Fallback to non-transactional bulk update
+		return c.bulkUpdateNonTransactional(updates)
+	}
+
+	var result *BulkUpdateResult
+	err := c.txManager.AutoTransaction(func(tx *transaction.Transaction) error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		if !tx.IsActive() {
+			return fmt.Errorf("transaction is not active")
+		}
+
+		result = &BulkUpdateResult{
+			UpdatedIDs: make([]string, 0, len(updates)),
+			Errors:     make([]error, 0),
+		}
+
+		// First, fetch all existing documents
+		oldDocs := make(map[string]*document.Document)
+		for i, update := range updates {
+			oldDoc, err := c.storage.Get(update.ID)
+			if err != nil {
+				return fmt.Errorf("document %d (id=%s) not found: %w", i, update.ID, err)
+			}
+			oldDocs[update.ID] = oldDoc
+		}
+
+		// Validate all updates first
+		for i, update := range updates {
+			oldDoc := oldDocs[update.ID]
+			newDoc := &document.Document{
+				ID:        oldDoc.ID,
+				CreatedAt: oldDoc.CreatedAt,
+				UpdatedAt: oldDoc.UpdatedAt,
+				Data:      make(map[string]interface{}),
+			}
+			// Copy old data
+			for k, v := range oldDoc.Data {
+				newDoc.Data[k] = v
+			}
+			// Apply updates
+			for k, v := range update.Data {
+				newDoc.Data[k] = v
+			}
+
+			if c.Schema != nil {
+				if err := c.Schema.Validate(newDoc); err != nil {
+					return fmt.Errorf("document %d (id=%s) validation failed: %w", i, update.ID, err)
+				}
+			}
+		}
+
+		// Apply all updates
+		for i, update := range updates {
+			oldDoc := oldDocs[update.ID]
+
+			// Create new document
+			newDoc := &document.Document{
+				ID:        oldDoc.ID,
+				CreatedAt: oldDoc.CreatedAt,
+				UpdatedAt: oldDoc.UpdatedAt,
+				Data:      make(map[string]interface{}),
+			}
+			for k, v := range oldDoc.Data {
+				newDoc.Data[k] = v
+			}
+			for k, v := range update.Data {
+				newDoc.Data[k] = v
+			}
+			newDoc.Update(newDoc.Data)
+
+			// Create operation for WAL
+			op := transaction.Operation{
+				Type:       transaction.OpUpdate,
+				Collection: c.Name,
+				DocumentID: newDoc.ID,
+				OldValue:   oldDoc,
+				NewValue:   newDoc,
+			}
+
+			// Record operation in transaction
+			if err := tx.AddOperation(op); err != nil {
+				return fmt.Errorf("failed to record operation for doc %d: %w", i, err)
+			}
+
+			// Update storage
+			if err := c.storage.Update(newDoc); err != nil {
+				return fmt.Errorf("failed to update document %d: %w", i, err)
+			}
+
+			// Update indexes
+			for field, idx := range c.indexes {
+				if oldValue, exists := oldDoc.Data[field]; exists {
+					idx.Delete(oldValue, newDoc.ID)
+				}
+				if newValue, exists := newDoc.Data[field]; exists {
+					idx.Insert(newValue, newDoc.ID)
+				}
+			}
+
+			// Update full-text index
+			if c.fulltextIndex != nil {
+				c.indexDocForFullTextLocked(newDoc)
+			}
+
+			result.UpdatedIDs = append(result.UpdatedIDs, newDoc.ID)
+			result.Count++
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// bulkUpdateNonTransactional performs bulk update without transactions
+func (c *Collection) bulkUpdateNonTransactional(updates []*BulkUpdateRequest) (*BulkUpdateResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	result := &BulkUpdateResult{
+		UpdatedIDs: make([]string, 0, len(updates)),
+		Errors:     make([]error, 0),
+	}
+
+	for i, update := range updates {
+		oldDoc, err := c.storage.Get(update.ID)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("document %d (id=%s): %w", i, update.ID, err))
+			continue
+		}
+
+		newDoc := &document.Document{
+			ID:        oldDoc.ID,
+			CreatedAt: oldDoc.CreatedAt,
+			UpdatedAt: oldDoc.UpdatedAt,
+			Data:      make(map[string]interface{}),
+		}
+		for k, v := range oldDoc.Data {
+			newDoc.Data[k] = v
+		}
+		for k, v := range update.Data {
+			newDoc.Data[k] = v
+		}
+		newDoc.Update(newDoc.Data)
+
+		if c.Schema != nil {
+			if err := c.Schema.Validate(newDoc); err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("document %d: %w", i, err))
+				continue
+			}
+		}
+
+		if err := c.storage.Update(newDoc); err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("document %d: %w", i, err))
+			continue
+		}
+
+		// Update indexes
+		for field, idx := range c.indexes {
+			if oldValue, exists := oldDoc.Data[field]; exists {
+				idx.Delete(oldValue, newDoc.ID)
+			}
+			if newValue, exists := newDoc.Data[field]; exists {
+				idx.Insert(newValue, newDoc.ID)
+			}
+		}
+
+		if c.fulltextIndex != nil {
+			c.indexDocForFullTextLocked(newDoc)
+		}
+
+		result.UpdatedIDs = append(result.UpdatedIDs, newDoc.ID)
+		result.Count++
+	}
+
+	return result, nil
+}
+
+// BulkDeleteResult represents the result of a bulk delete operation
+type BulkDeleteResult struct {
+	DeletedIDs []string `json:"deletedIds"`
+	Count      int      `json:"count"`
+	Errors     []error  `json:"errors,omitempty"`
+}
+
+// BulkDelete deletes multiple documents in a single transaction
+// If any delete fails, the entire operation is rolled back
+func (c *Collection) BulkDelete(ids []string) (*BulkDeleteResult, error) {
+	if c.txManager == nil {
+		// Fallback to non-transactional bulk delete
+		return c.bulkDeleteNonTransactional(ids)
+	}
+
+	var result *BulkDeleteResult
+	err := c.txManager.AutoTransaction(func(tx *transaction.Transaction) error {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+
+		if !tx.IsActive() {
+			return fmt.Errorf("transaction is not active")
+		}
+
+		result = &BulkDeleteResult{
+			DeletedIDs: make([]string, 0, len(ids)),
+			Errors:     make([]error, 0),
+		}
+
+		// First, fetch all existing documents
+		docs := make(map[string]*document.Document)
+		for i, id := range ids {
+			doc, err := c.storage.Get(id)
+			if err != nil {
+				return fmt.Errorf("document %d (id=%s) not found: %w", i, id, err)
+			}
+			docs[id] = doc
+		}
+
+		// Delete all documents
+		for i, id := range ids {
+			doc := docs[id]
+
+			// Create operation for WAL
+			op := transaction.Operation{
+				Type:       transaction.OpDelete,
+				Collection: c.Name,
+				DocumentID: id,
+				OldValue:   doc,
+				NewValue:   nil,
+			}
+
+			// Record operation in transaction
+			if err := tx.AddOperation(op); err != nil {
+				return fmt.Errorf("failed to record operation for doc %d: %w", i, err)
+			}
+
+			// Delete from storage
+			if err := c.storage.Delete(id); err != nil {
+				return fmt.Errorf("failed to delete document %d: %w", i, err)
+			}
+
+			// Remove from indexes
+			for field, idx := range c.indexes {
+				if value, exists := doc.Data[field]; exists {
+					idx.Delete(value, id)
+				}
+			}
+
+			// Remove from full-text index
+			if c.fulltextIndex != nil {
+				c.fulltextIndex.RemoveDocument(id)
+			}
+
+			result.DeletedIDs = append(result.DeletedIDs, id)
+			result.Count++
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	return result, nil
+}
+
+// bulkDeleteNonTransactional performs bulk delete without transactions
+func (c *Collection) bulkDeleteNonTransactional(ids []string) (*BulkDeleteResult, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	result := &BulkDeleteResult{
+		DeletedIDs: make([]string, 0, len(ids)),
+		Errors:     make([]error, 0),
+	}
+
+	for i, id := range ids {
+		doc, err := c.storage.Get(id)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("document %d (id=%s): %w", i, id, err))
+			continue
+		}
+
+		if err := c.storage.Delete(id); err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("document %d: %w", i, err))
+			continue
+		}
+
+		// Remove from indexes
+		for field, idx := range c.indexes {
+			if value, exists := doc.Data[field]; exists {
+				idx.Delete(value, id)
+			}
+		}
+
+		if c.fulltextIndex != nil {
+			c.fulltextIndex.RemoveDocument(id)
+		}
+
+		result.DeletedIDs = append(result.DeletedIDs, id)
+		result.Count++
+	}
+
+	return result, nil
 }

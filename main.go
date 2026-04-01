@@ -6,7 +6,9 @@ import (
 	"aidb/internal/collection"
 	"aidb/internal/config"
 	"aidb/internal/rbac"
+	"aidb/internal/transaction"
 	"aidb/internal/vector"
+	"aidb/internal/wal"
 	"context"
 	"fmt"
 	"log"
@@ -61,6 +63,47 @@ func main() {
 
 	// Create the API handler
 	handler := api.NewHandler(collectionManager, authService, enforcer)
+
+	// Initialize WAL for transaction support
+	if cfg.TransactionsEnabled {
+		walConfig := wal.DefaultConfig(cfg.DataDir)
+		walConfig.SegmentSize = int64(cfg.WALMaxSegmentSizeMB) * 1024 * 1024
+
+		// Set sync policy based on config
+		switch cfg.WALSyncPolicy {
+		case "every_write":
+			walConfig.SyncPolicy = wal.SyncOnEveryWrite
+		case "async":
+			walConfig.SyncPolicy = wal.SyncAsync
+		default:
+			walConfig.SyncPolicy = wal.SyncOnCommit
+		}
+
+		writeAheadLog, err := wal.NewFileWAL(walConfig)
+		if err != nil {
+			log.Fatalf("Failed to initialize WAL: %v", err)
+		}
+		defer writeAheadLog.Close()
+
+		// Initialize Transaction Manager
+		txManagerConfig := transaction.DefaultManagerConfig()
+		txManagerConfig.AutoCommitEnabled = cfg.TransactionAutoCommit
+		txManagerConfig.DefaultTimeout = time.Duration(cfg.TransactionTimeoutSec) * time.Second
+
+		txManager := transaction.NewManager(writeAheadLog, txManagerConfig)
+		defer txManager.Close()
+
+		// Set transaction manager on collection manager
+		collectionManager.SetTransactionManager(txManager)
+
+		// Set transaction manager on API handler (for async transactions)
+		handler.SetTransactionManager(txManager)
+
+		log.Printf("Transaction support enabled: auto-commit=%v, timeout=%ds, wal-sync=%s",
+			txManagerConfig.AutoCommitEnabled, cfg.TransactionTimeoutSec, cfg.WALSyncPolicy)
+	} else {
+		log.Println("Transaction support disabled")
+	}
 
 	// Create the Vector API handler
 	vectorHandler := api.NewVectorHandler(vectorManager, authService, enforcer)
