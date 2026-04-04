@@ -87,6 +87,11 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /api/v1/collections/{name}/indexes", protected(h.ListIndexes))
 	mux.Handle("DELETE /api/v1/collections/{name}/indexes/{field}", protected(h.DropIndex))
 
+	// Query stats and explain routes
+	mux.Handle("GET /api/v1/collections/{name}/explain", protected(h.ExplainQuery))
+	mux.Handle("GET /api/v1/collections/{name}/query-stats", protected(h.GetQueryStats))
+	mux.Handle("GET /api/v1/collections/{name}/auto-index/recommendations", protected(h.GetIndexRecommendations))
+
 	// Full-text search routes
 	mux.Handle("GET /api/v1/collections/{name}/fulltext-index", protected(h.GetFullTextIndex))
 	mux.Handle("POST /api/v1/collections/{name}/fulltext-index", protected(h.CreateFullTextIndex))
@@ -734,7 +739,8 @@ func (h *Handler) FindDocuments(w http.ResponseWriter, r *http.Request) {
 
 	// Check if there's a filter in the query parameters
 	filter := make(map[string]interface{})
-	
+	includeStats := false
+
 	// Parse query parameters for simple filtering
 	query := r.URL.Query()
 	for key, values := range query {
@@ -744,6 +750,8 @@ func (h *Handler) FindDocuments(w http.ResponseWriter, r *http.Request) {
 			if err := json.Unmarshal([]byte(values[0]), &jsonFilter); err == nil {
 				filter = jsonFilter
 			}
+		} else if key == "includeStats" {
+			includeStats = values[0] == "true"
 		} else if !strings.HasPrefix(key, "_") {
 			// Simple key=value filter from query params
 			if len(values) > 0 {
@@ -753,8 +761,13 @@ func (h *Handler) FindDocuments(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var documents []*document.Document
+	var queryStats collection.QueryStats
 	if len(filter) > 0 {
-		documents, err = col.Find(filter)
+		if includeStats {
+			documents, queryStats, err = col.FindWithStats(filter)
+		} else {
+			documents, err = col.Find(filter)
+		}
 	} else {
 		documents, err = col.FindAll()
 	}
@@ -791,10 +804,16 @@ func (h *Handler) FindDocuments(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeSuccess(w, map[string]interface{}{
+	// Build response
+	resp := map[string]interface{}{
 		"documents": documents,
 		"count":     len(documents),
-	})
+	}
+	if includeStats {
+		resp["stats"] = queryStats
+	}
+
+	writeSuccess(w, resp)
 }
 
 // GetSchema returns the schema for a collection
@@ -847,6 +866,74 @@ func (h *Handler) SetSchema(w http.ResponseWriter, r *http.Request) {
 	writeSuccess(w, map[string]interface{}{
 		"message":   "schema updated",
 		"hasSchema": req.Schema != nil,
+	})
+}
+
+// ExplainQuery returns an execution plan for a query (EXPLAIN)
+func (h *Handler) ExplainQuery(w http.ResponseWriter, r *http.Request) {
+	collectionName := r.PathValue("name")
+
+	col, err := h.collectionManager.GetCollection(collectionName)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	// Parse filter from query params
+	filter := make(map[string]interface{})
+	query := r.URL.Query()
+	for key, values := range query {
+		if key == "filter" {
+			var jsonFilter map[string]interface{}
+			if err := json.Unmarshal([]byte(values[0]), &jsonFilter); err == nil {
+				filter = jsonFilter
+			}
+		} else if !strings.HasPrefix(key, "_") && key != "includeStats" {
+			if len(values) > 0 {
+				filter[key] = values[0]
+			}
+		}
+	}
+
+	plan := col.ExplainQuery(filter)
+	writeSuccess(w, map[string]interface{}{
+		"plan": plan,
+	})
+}
+
+// GetQueryStats returns query statistics for a collection
+func (h *Handler) GetQueryStats(w http.ResponseWriter, r *http.Request) {
+	collectionName := r.PathValue("name")
+
+	col, err := h.collectionManager.GetCollection(collectionName)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	summary := col.GetQueryStats()
+	recent := col.GetRecentQueries(20) // last 20 queries
+
+	writeSuccess(w, map[string]interface{}{
+		"summary": summary,
+		"recent":  recent,
+	})
+}
+
+// GetIndexRecommendations returns auto-index recommendations for a collection
+func (h *Handler) GetIndexRecommendations(w http.ResponseWriter, r *http.Request) {
+	collectionName := r.PathValue("name")
+
+	col, err := h.collectionManager.GetCollection(collectionName)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+
+	recommendations := col.GetIndexRecommendations()
+	writeSuccess(w, map[string]interface{}{
+		"recommendations": recommendations,
+		"count":           len(recommendations),
 	})
 }
 

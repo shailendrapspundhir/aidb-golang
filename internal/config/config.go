@@ -62,6 +62,15 @@ type Config struct {
 
 	// Recovery configuration
 	SkipRecovery bool // If true, skip WAL recovery on startup (default false)
+
+	// Auto-indexing configuration
+	AutoIndexEnabled            bool    // Enable/disable automatic index creation
+	AutoIndexMinQueryCount      int64   // Min queries on a field before considering index
+	AutoIndexMinFullScanRatio   float64 // Min full-scan ratio to consider indexing
+	AutoIndexMaxSingleIndexes   int     // Max auto-created single-field indexes per collection
+	AutoIndexMaxComposite       int     // Max auto-created composite indexes per collection
+	AutoIndexConfidence         float64 // Min confidence score (0-1) to auto-create
+	AutoIndexReanalysisPeriodMs int     // Milliseconds between re-analysis (0 = disabled)
 }
 
 // Default values
@@ -77,6 +86,15 @@ const (
 	DefaultCacheSizeMB   = 256  // 256 MB default cache
 	DefaultCacheEnabled  = true
 	DefaultIndexEnabled  = true
+
+	// Auto-indexing defaults
+	DefaultAutoIndexEnabled          = true
+	DefaultAutoIndexMinQueryCount    = 100
+	DefaultAutoIndexMinFullScanRatio = 0.5
+	DefaultAutoIndexMaxSingle        = 5
+	DefaultAutoIndexMaxComposite     = 3
+	DefaultAutoIndexConfidence       = 0.6
+	DefaultAutoIndexReanalysisMs     = 600000 // 10 minutes
 
 	// Memory Controller defaults
 	DefaultMemorySafetyPercent   = 10
@@ -150,6 +168,15 @@ func Load() *Config {
 	cacheSizeMB := getEnvInt("AIDB_CACHE_SIZE_MB", DefaultCacheSizeMB)
 	cacheEnabled := getEnvBool("AIDB_CACHE_ENABLED", DefaultCacheEnabled)
 	indexEnabled := getEnvBool("AIDB_INDEX_ENABLED", DefaultIndexEnabled)
+
+	// Auto-indexing configuration
+	autoIndexEnabled := getEnvBool("AIDB_AUTO_INDEX_ENABLED", DefaultAutoIndexEnabled)
+	autoIndexMinQueryCount := getEnvInt64("AIDB_AUTO_INDEX_MIN_QUERY_COUNT", DefaultAutoIndexMinQueryCount)
+	autoIndexMinFullScanRatio := getEnvFloat64("AIDB_AUTO_INDEX_MIN_FULL_SCAN_RATIO", DefaultAutoIndexMinFullScanRatio)
+	autoIndexMaxSingle := getEnvInt("AIDB_AUTO_INDEX_MAX_SINGLE", DefaultAutoIndexMaxSingle)
+	autoIndexMaxComposite := getEnvInt("AIDB_AUTO_INDEX_MAX_COMPOSITE", DefaultAutoIndexMaxComposite)
+	autoIndexConfidence := getEnvFloat64("AIDB_AUTO_INDEX_CONFIDENCE", DefaultAutoIndexConfidence)
+	autoIndexReanalysisMs := getEnvInt("AIDB_AUTO_INDEX_REANALYSIS_MS", DefaultAutoIndexReanalysisMs)
 
 	// Memory Controller configuration
 	memoryLimitMB := getEnvInt64("AIDB_MEMORY_LIMIT_MB", 0) // 0 = auto-detect
@@ -230,6 +257,14 @@ func Load() *Config {
 		WALMaxSegmentSizeMB:       walMaxSegmentSizeMB,
 
 		SkipRecovery: skipRecovery,
+
+		AutoIndexEnabled:            autoIndexEnabled,
+		AutoIndexMinQueryCount:      autoIndexMinQueryCount,
+		AutoIndexMinFullScanRatio:   autoIndexMinFullScanRatio,
+		AutoIndexMaxSingleIndexes:   autoIndexMaxSingle,
+		AutoIndexMaxComposite:       autoIndexMaxComposite,
+		AutoIndexConfidence:         autoIndexConfidence,
+		AutoIndexReanalysisPeriodMs: autoIndexReanalysisMs,
 	}
 }
 

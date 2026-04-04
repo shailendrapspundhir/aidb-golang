@@ -16,6 +16,20 @@ const (
 	IndexTypeFull  IndexType = "full"   // Full-text index
 )
 
+// IndexStats holds statistics about an index
+type IndexStats struct {
+	Name        string    `json:"name"`
+	Field       string    `json:"field"`
+	Type        IndexType `json:"type"`
+	EntryCount  int       `json:"entryCount"`
+	Cardinality int       `json:"cardinality"` // unique keys
+	// For BTree
+	Height       int `json:"height,omitempty"`
+	NodeCount    int `json:"nodeCount,omitempty"`
+	// For Hash
+	BucketCount  int `json:"bucketCount,omitempty"`
+}
+
 // Index defines the interface for indexes
 type Index interface {
 	// Insert adds a key-documentID pair to the index
@@ -47,6 +61,9 @@ type Index interface {
 	
 	// Type returns the index type
 	Type() IndexType
+	
+	// Stats returns index statistics
+	Stats() IndexStats
 }
 
 // BTreeIndex is a B-tree based index for range queries
@@ -216,6 +233,43 @@ func (idx *BTreeIndex) Field() string { return idx.field }
 
 // Type returns the index type
 func (idx *BTreeIndex) Type() IndexType { return IndexTypeBTree }
+
+// Stats returns index statistics for BTreeIndex
+func (idx *BTreeIndex) Stats() IndexStats {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	// Count unique keys (cardinality) and estimate height
+	cardinality := 0
+	height := 0
+	nodeCount := 0
+
+	var countNodes func(n *btreeNode, level int)
+	countNodes = func(n *btreeNode, level int) {
+		if n == nil {
+			return
+		}
+		nodeCount++
+		if level > height {
+			height = level
+		}
+		cardinality += len(n.keys)
+		for _, child := range n.children {
+			countNodes(child, level+1)
+		}
+	}
+	countNodes(idx.root, 1)
+
+	return IndexStats{
+		Name:        idx.name,
+		Field:       idx.field,
+		Type:        IndexTypeBTree,
+		EntryCount:  idx.count,
+		Cardinality: cardinality,
+		Height:      height,
+		NodeCount:   nodeCount,
+	}
+}
 
 // Internal methods
 
@@ -521,6 +575,22 @@ func (idx *HashIndex) Field() string { return idx.field }
 
 // Type returns the index type
 func (idx *HashIndex) Type() IndexType { return IndexTypeHash }
+
+// Stats returns index statistics for HashIndex
+func (idx *HashIndex) Stats() IndexStats {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	cardinality := len(idx.data)
+	return IndexStats{
+		Name:        idx.name,
+		Field:       idx.field,
+		Type:        IndexTypeHash,
+		EntryCount:  idx.count,
+		Cardinality: cardinality,
+		BucketCount: cardinality,
+	}
+}
 
 // Helper functions
 

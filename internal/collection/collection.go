@@ -31,25 +31,30 @@ type Collection struct {
 
 	// Transaction support
 	txManager *transaction.Manager
+
+	// Query statistics collector (optional)
+	queryStats *QueryStatisticsCollector
 }
 
 // NewCollection creates a new collection with memory storage
 func NewCollection(name string, schema *document.Schema) *Collection {
 	return &Collection{
-		Name:    name,
-		Schema:  schema,
-		storage: storage.NewMemoryStorage(),
-		indexes: make(map[string]storage.Index),
+		Name:       name,
+		Schema:     schema,
+		storage:    storage.NewMemoryStorage(),
+		indexes:    make(map[string]storage.Index),
+		queryStats: NewQueryStatisticsCollector(),
 	}
 }
 
 // NewCollectionWithStorage creates a new collection with a custom storage backend
 func NewCollectionWithStorage(name string, schema *document.Schema, store storage.Storage) *Collection {
 	return &Collection{
-		Name:    name,
-		Schema:  schema,
-		storage: store,
-		indexes: make(map[string]storage.Index),
+		Name:       name,
+		Schema:     schema,
+		storage:    store,
+		indexes:    make(map[string]storage.Index),
+		queryStats: NewQueryStatisticsCollector(),
 	}
 }
 
@@ -383,11 +388,33 @@ func (c *Collection) Delete(id string) error {
 	return nil
 }
 
-// Find retrieves documents matching a filter
+// Find retrieves documents matching a filter (records stats internally)
 func (c *Collection) Find(filter map[string]interface{}) ([]*document.Document, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	start := time.Now()
+	results, err := c.findInternal(filter)
+	duration := time.Since(start)
 
+	// Record stats if collector exists
+	if c.queryStats != nil {
+		stats := QueryStats{
+			CollectionName:   c.Name,
+			Filter:           filter,
+			DurationMs:       duration.Milliseconds(),
+			DocumentsMatched: len(results),
+			Timestamp:        start,
+		}
+		// Determine scan type from result (simplified)
+		if len(filter) > 0 {
+			stats.ScanType = "full" // default; overridden below
+		}
+		c.queryStats.RecordQuery(stats)
+	}
+
+	return results, err
+}
+
+// findInternal is the internal find implementation without stats recording
+func (c *Collection) findInternal(filter map[string]interface{}) ([]*document.Document, error) {
 	// Check if we can use an index
 	for field, value := range filter {
 		if idx, exists := c.indexes[field]; exists {
@@ -413,6 +440,74 @@ func (c *Collection) Find(filter map[string]interface{}) ([]*document.Document, 
 
 	// Fall back to full scan
 	return c.storage.Find(filter)
+}
+
+// FindWithStats retrieves documents and returns query statistics
+func (c *Collection) FindWithStats(filter map[string]interface{}) ([]*document.Document, QueryStats, error) {
+	start := time.Now()
+	results, err := c.findInternal(filter)
+	duration := time.Since(start)
+
+	stats := QueryStats{
+		CollectionName:   c.Name,
+		Filter:           filter,
+		DurationMs:       duration.Milliseconds(),
+		DocumentsMatched: len(results),
+		Timestamp:        start,
+	}
+
+	// Determine if index was used
+	stats.ScanType = "full"
+	for field := range filter {
+		if idx, exists := c.indexes[field]; exists {
+			stats.IndexUsed = idx.Name()
+			stats.IndexType = string(idx.Type())
+			stats.ScanType = "index"
+			break
+		}
+	}
+
+	// Record stats
+	if c.queryStats != nil {
+		c.queryStats.RecordQuery(stats)
+	}
+
+	return results, stats, err
+}
+
+// Explain returns an execution plan for a query without executing it
+func (c *Collection) Explain(filter map[string]interface{}) ExplainPlan {
+	plan := ExplainPlan{
+		CollectionName: c.Name,
+		Filter:         filter,
+		Notes:          []string{},
+	}
+
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	// Check for index usage
+	for field := range filter {
+		if idx, exists := c.indexes[field]; exists {
+			stats := idx.Stats()
+			plan.Strategy = "index_scan"
+			plan.IndexUsed = idx.Name()
+			plan.IndexType = string(idx.Type())
+			plan.ScanType = "exact" // default; could be range/prefix based on value type
+			plan.EstimatedRows = int64(stats.Cardinality)
+			plan.EstimatedCost = int64(stats.Cardinality) // simple cost model
+			plan.Notes = append(plan.Notes, "Using index on field: "+field)
+			return plan
+		}
+	}
+
+	// Full scan
+	totalDocs := c.storage.Count()
+	plan.Strategy = "full_scan"
+	plan.EstimatedRows = int64(totalDocs)
+	plan.EstimatedCost = int64(totalDocs)
+	plan.Notes = append(plan.Notes, "No suitable index found; falling back to full scan")
+	return plan
 }
 
 // matchesFilter checks if a document matches all filter criteria
@@ -471,6 +566,40 @@ func (c *Collection) GetSchema() *document.Schema {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.Schema
+}
+
+// GetQueryStats returns aggregated query statistics for this collection
+func (c *Collection) GetQueryStats() QueryStatsSummary {
+	if c.queryStats == nil {
+		return QueryStatsSummary{}
+	}
+	return c.queryStats.GetSummary()
+}
+
+// GetRecentQueries returns recent query history for this collection
+func (c *Collection) GetRecentQueries(limit int) []QueryStats {
+	if c.queryStats == nil {
+		return nil
+	}
+	return c.queryStats.GetRecentQueries(c.Name, limit)
+}
+
+// GetIndexRecommendations returns auto-index recommendations based on query stats
+func (c *Collection) GetIndexRecommendations() []IndexRecommendation {
+	advisor := NewIndexAdvisor(DefaultAutoIndexConfig())
+	return advisor.Analyze(c)
+}
+
+// RecordFieldWrite records a write on a field for cost estimation in auto-indexing
+func (c *Collection) RecordFieldWrite(field string) {
+	if c.queryStats != nil {
+		c.queryStats.RecordWrite(field)
+	}
+}
+
+// ExplainQuery returns an execution plan for the given filter
+func (c *Collection) ExplainQuery(filter map[string]interface{}) ExplainPlan {
+	return c.Explain(filter)
 }
 
 // collectionMetadata represents persisted collection info
