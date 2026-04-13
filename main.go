@@ -42,6 +42,12 @@ func main() {
 		log.Fatalf("Failed to initialize collection manager: %v", err)
 	}
 
+	// Initialize the unified collection manager using the same database connection
+	unifiedManager, err := collection.NewUnifiedManagerWithDB(cfg, collectionManager.GetDB())
+	if err != nil {
+		log.Fatalf("Failed to initialize unified collection manager: %v", err)
+	}
+
 	// Ensure database is closed on exit
 	defer func() {
 		if err := collectionManager.Close(); err != nil {
@@ -129,6 +135,9 @@ func main() {
 	// Create the Vector API handler
 	vectorHandler := api.NewVectorHandler(vectorManager, authService, enforcer)
 
+	// Create the Unified API handler
+	unifiedHandler := api.NewUnifiedHandler(unifiedManager, authService, enforcer)
+
 	// Create a new serve mux
 	mux := http.NewServeMux()
 
@@ -142,6 +151,9 @@ func main() {
 
 	// Register vector routes
 	vectorHandler.RegisterVectorRoutes(mux, protected)
+
+	// Register unified routes (API v2)
+	unifiedHandler.RegisterUnifiedRoutes(mux, protected)
 
 	// WebSocket streaming endpoint
 	mux.HandleFunc("GET /api/v1/ws", api.HandleWebSocket)
