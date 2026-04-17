@@ -459,3 +459,13 @@ type Stats struct {
 	SegmentCount int
 	CurrentSize  int64
 }
+
+// GetSegments returns a copy of the current segment file paths (for archiver/backup).
+func (w *FileWAL) GetSegments() []string {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	segments := make([]string, len(w.segments))
+	copy(segments, w.segments)
+	return segments
+}

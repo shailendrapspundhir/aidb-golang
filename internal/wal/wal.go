@@ -285,6 +285,9 @@ type WAL interface {
 
 	// GetFirstLSN returns the LSN of the first entry
 	GetFirstLSN() uint64
+
+	// GetSegments returns list of current segment paths (for archiver/backup)
+	GetSegments() []string
 }
 
 // SyncPolicy defines when WAL syncs to disk

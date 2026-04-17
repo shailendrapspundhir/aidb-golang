@@ -63,6 +63,12 @@ type Config struct {
 	// Recovery configuration
 	SkipRecovery bool // If true, skip WAL recovery on startup (default false)
 
+	// PITR / Backup configuration
+	BackupDir          string // Directory for base backups
+	WALArchiveDir      string // Directory for archived WAL segments
+	EnablePITR         bool   // Enable PITR features
+	CheckpointInterval int    // Seconds between automatic checkpoints
+
 	// Auto-indexing configuration
 	AutoIndexEnabled            bool    // Enable/disable automatic index creation
 	AutoIndexMinQueryCount      int64   // Min queries on a field before considering index

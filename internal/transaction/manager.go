@@ -2,7 +2,6 @@ package transaction
 
 import (
 	"fmt"
-	"log"
 	"sync"
 	"time"
 
@@ -123,35 +122,31 @@ func (m *Manager) GetWAL() wal.WAL {
 	return m.wal
 }
 
-// Commit commits a transaction: flushes deferred writes to storage, then records
-// COMMIT in the WAL. If the storage flush fails, all applied writes are undone and
-// the transaction is rolled back. If WAL commit fails after a successful flush the
-// applied writes are undone best-effort and an error is returned.
+// Commit commits a transaction using proper WAL ordering:
+// 1. Write COMMIT record to WAL and fsync (makes commit durable)
+// 2. Apply deferred writes to storage (idempotent)
+// This ensures durability: if crash after WAL sync, recovery will REDO the tx.
 func (m *Manager) Commit(tx *Transaction) error {
 	ops := tx.GetOperations()
 
-	// Step 1: Flush deferred writes to storage
-	if m.storageApplier != nil && len(ops) > 0 {
-		if err := m.storageApplier.ApplyOperations(ops); err != nil {
-			// Flush failed — rollback (WAL ABORT + discard buffer)
-			if rbErr := m.Rollback(tx); rbErr != nil {
-				log.Printf("rollback after flush failure also failed: %v", rbErr)
-			}
-			return fmt.Errorf("commit failed — storage flush error: %w", err)
-		}
-	}
-
-	// Step 2: Write COMMIT record to WAL and fsync
+	// Step 1: Write COMMIT record to WAL and fsync FIRST (durability guarantee)
 	_, err := tx.Commit()
 	if err != nil {
-		// WAL commit failed after storage writes succeeded — undo storage writes
-		if m.storageApplier != nil && len(ops) > 0 {
-			m.storageApplier.UndoOperations(ops)
-		}
 		m.mu.Lock()
 		delete(m.activeTx, tx.ID)
 		m.mu.Unlock()
 		return fmt.Errorf("commit failed — WAL error: %w", err)
+	}
+
+	// Step 2: Now safely apply changes to storage (idempotent operations)
+	if m.storageApplier != nil && len(ops) > 0 {
+		if applyErr := m.storageApplier.ApplyOperations(ops); applyErr != nil {
+			// WAL commit is already durable — recovery will REDO on restart
+			m.mu.Lock()
+			delete(m.activeTx, tx.ID)
+			m.mu.Unlock()
+			return fmt.Errorf("storage apply failed after durable commit: %w", applyErr)
+		}
 	}
 
 	// Remove from active transactions

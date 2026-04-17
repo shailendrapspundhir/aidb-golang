@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -274,4 +275,85 @@ func deserializeDoc(data []byte) (*document.Document, error) {
 		return nil, err
 	}
 	return &doc, nil
+}
+
+// ---------------------------------------------------------------------------
+// PITR Support: Recover to specific LSN or Timestamp
+// ---------------------------------------------------------------------------
+
+// RecoverToLSN performs recovery and stops replay at the given target LSN (for PITR).
+func (rm *RecoveryManager) RecoverToLSN(targetLSN uint64) (*RecoveryResult, error) {
+	log.Printf("[PITR] Starting recovery to LSN %d", targetLSN)
+	return rm.recoverWithFilter(func(e *LogEntry) bool {
+		return e.LSN <= targetLSN
+	})
+}
+
+// RecoverToTime performs recovery and stops at the first entry after the target time (for PITR).
+func (rm *RecoveryManager) RecoverToTime(targetTime time.Time) (*RecoveryResult, error) {
+	log.Printf("[PITR] Starting recovery to time %s", targetTime)
+	targetNano := targetTime.UnixNano()
+	return rm.recoverWithFilter(func(e *LogEntry) bool {
+		return e.Timestamp <= targetNano
+	})
+}
+
+// recoverWithFilter is the internal implementation used by PITR methods.
+func (rm *RecoveryManager) recoverWithFilter(shouldApply func(*LogEntry) bool) (*RecoveryResult, error) {
+	result := &RecoveryResult{Errors: make([]error, 0)}
+
+	entries, err := rm.wal.ReadAll()
+	if err != nil {
+		return nil, err
+	}
+
+	// Filter entries
+	var filtered []*LogEntry
+	for _, e := range entries {
+		if shouldApply(e) {
+			filtered = append(filtered, e)
+		}
+	}
+
+	// Reuse most of the existing analysis + redo logic on filtered entries
+	// (Simplified version for clarity - full version would reuse more code)
+	txMap := make(map[string]*RecoveredTx)
+	for _, entry := range filtered {
+		if entry.TxID == "" {
+			continue
+		}
+		if _, ok := txMap[entry.TxID]; !ok {
+			txMap[entry.TxID] = &RecoveredTx{TxID: entry.TxID, State: TxFinalInFlight, Operations: []*LogEntry{}}
+		}
+		tx := txMap[entry.TxID]
+		switch entry.Type {
+		case LogEntryCommitTx:
+			tx.State = TxFinalCommitted
+		case LogEntryAbortTx:
+			tx.State = TxFinalAborted
+		default:
+			if entry.IsDataOperation() {
+				tx.Operations = append(tx.Operations, entry)
+			}
+		}
+	}
+
+	for _, tx := range txMap {
+		if tx.State == TxFinalCommitted {
+			for _, op := range tx.Operations {
+				rm.redoEntry(op)
+				result.RedoneOps++
+			}
+			result.CommittedTx++
+		} else if tx.State == TxFinalInFlight {
+			for i := len(tx.Operations) - 1; i >= 0; i-- {
+				rm.undoEntry(tx.Operations[i])
+				result.UndoneOps++
+			}
+			result.InFlightTx++
+		}
+	}
+
+	log.Printf("[PITR] Recovery complete: %d redone, %d undone", result.RedoneOps, result.UndoneOps)
+	return result, nil
 }
